@@ -121,8 +121,8 @@ class MoleculeEditor:
     SNAP_ANGLES = tuple(range(0, 360, 30))
 
     TOOL_HELP = {
-        "draw": "Draw: click blank = bond, click atom = add bond, drag = fixed-length bond, "
-                "click bond = cycle order. Hover atom + letter changes element.",
+        "draw": "Draw: click blank = fresh atom (C is CH4 when isolated), click atom = add bond, "
+                "drag = fixed-length bond, click bond = cycle order. Hover atom + letter changes element.",
         "select": "Select: click, shift-click, or drag a box. Ring buttons fuse onto a selected bond.",
         "move": "Move: drag a molecule fragment or a reaction annotation.",
         "erase": "Erase: click an atom to remove it. Click a double/triple bond to remove one line per click; a single bond is removed entirely. Right-click deletes the whole object.",
@@ -229,13 +229,20 @@ class MoleculeEditor:
         second.pack(side=tk.TOP, fill=tk.X)
 
         tk.Label(second, text="Ring").pack(side=tk.LEFT, padx=(2, 4))
+        # Ring templates supported by the editor. Heteroaromatic templates use
+        # explicit Kekule bond orders and the indicated heteroatoms.
         self.ring_options = {
-            "Benzene": (6, True),
-            "Cyclohexane": (6, False),
-            "Cyclopentane": (5, False),
-            "Cyclopropane": (3, False),
-            "Cyclobutane": (4, False),
-            "Cycloheptane": (7, False),
+            "Benzene (aromatic)": (6, True),
+            "Cyclopropane": (3, False), "Cyclobutane": (4, False),
+            "Cyclopentane": (5, False), "Cyclohexane": (6, False),
+            "Cycloheptane": (7, False), "Cyclooctane": (8, False),
+            "Cyclononane": (9, False), "Cyclodecane": (10, False),
+            "Cycloundecane": (11, False), "Cyclododecane": (12, False),
+            "Cyclopentadiene": "Cyclopentadiene",
+            "Cyclohexene": "Cyclohexene", "Cyclopentene": "Cyclopentene",
+            "Pyridine": "Pyridine", "Pyrimidine": "Pyrimidine",
+            "Pyrazine": "Pyrazine", "Pyridazine": "Pyridazine",
+            "Furan": "Furan", "Thiophene": "Thiophene", "Pyrrole": "Pyrrole",
         }
         self.selected_ring = tk.StringVar(value="Benzene")
         ttk.Combobox(second, textvariable=self.selected_ring,
@@ -246,20 +253,44 @@ class MoleculeEditor:
 
         ttk.Separator(second, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=7)
         tk.Label(second, text="Group").pack(side=tk.LEFT, padx=(0, 4))
-        self.group_options = {"CH₃": "CH3", "OH": "OH", "NH₂": "NH2", "COOH": "COOH"}
-        self.selected_group = tk.StringVar(value="CH₃")
+        self.group_options = {
+            "Methyl (–CH₃)": "CH3", "Ethyl (–CH₂CH₃)": "C2H5",
+            "n-Propyl": "C3H7", "Isopropyl": "iPr", "tert-Butyl": "tBu",
+            "Vinyl (–CH=CH₂)": "vinyl", "Ethynyl (–C≡CH)": "ethynyl",
+            "Phenyl (–C₆H₅)": "phenyl", "Hydroxy (–OH)": "OH",
+            "Methoxy (–OCH₃)": "OMe", "Ethoxy (–OCH₂CH₃)": "OEt",
+            "Amino (–NH₂)": "NH2", "Dimethylamino (–N(CH₃)₂)": "NMe2",
+            "Amide (–CONH₂)": "CONH2", "Acetyl (–COCH₃)": "COCH3",
+            "Formyl (–CHO)": "CHO", "Carboxyl (–COOH)": "COOH",
+            "Methyl ester (–COOCH₃)": "COOMe", "Cyano (–C≡N)": "CN",
+            "Nitro (–NO₂)": "NO2", "Fluoro (–F)": "F",
+            "Chloro (–Cl)": "Cl", "Bromo (–Br)": "Br", "Iodo (–I)": "I",
+            "Thiol (–SH)": "SH", "Methylthio (–SCH₃)": "SMe",
+            "Sulfonic acid (–SO₃H)": "SO3H", "Phosphonic acid (–PO₃H₂)": "PO3H2",
+            "Aldehyde-side carbonyl (–C(=O)H)": "CHO",
+        }
+        self.selected_group = tk.StringVar(value="Methyl (–CH₃)")
         ttk.Combobox(second, textvariable=self.selected_group,
-                     values=list(self.group_options), state="readonly", width=7).pack(
+                     values=list(self.group_options), state="readonly", width=23).pack(
                          side=tk.LEFT, padx=(0, 3))
         tk.Button(second, text="Place group", command=self._request_selected_group).pack(
             side=tk.LEFT, padx=(0, 8))
 
         ttk.Separator(second, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=7)
-        tk.Label(second, text="Reaction").pack(side=tk.LEFT, padx=(0, 3))
-        for value, label in (("arrow", "→ Arrow"), ("equilibrium", "⇌ Equilibrium"),
-                             ("plus", "+ Plus"), ("equals", "= Equals"), ("text", "Text")):
-            tk.Radiobutton(second, text=label, variable=self.tool, value=value,
-                           command=self._tool_changed, takefocus=False).pack(side=tk.LEFT, padx=1)
+        tk.Label(second, text="Reaction symbol").pack(side=tk.LEFT, padx=(0, 3))
+        self.reaction_options = {
+            "Reaction arrow (→)": "arrow",
+            "Equilibrium (⇌)": "equilibrium",
+            "Plus sign (+)": "plus",
+            "Equals sign (=)": "equals",
+            "Text box / condition": "text",
+        }
+        self.selected_reaction = tk.StringVar(value="Reaction arrow (→)")
+        ttk.Combobox(second, textvariable=self.selected_reaction,
+                     values=list(self.reaction_options), state="readonly", width=19).pack(
+                         side=tk.LEFT, padx=(0, 3))
+        tk.Button(second, text="Use symbol", command=self._activate_reaction_tool).pack(
+            side=tk.LEFT, padx=(0, 4))
 
         third = tk.Frame(self.root, padx=5, pady=3)
         third.pack(side=tk.TOP, fill=tk.X)
@@ -326,6 +357,7 @@ class MoleculeEditor:
 
     def _bind_events(self):
         self.canvas.bind("<Button-1>", self.on_click)
+        self.canvas.bind("<Double-Button-1>", self.on_double_click)
         self.canvas.bind("<B1-Motion>", self.on_drag)
         self.canvas.bind("<ButtonRelease-1>", self.on_release)
         self.canvas.bind("<Button-3>", self.on_right_click)
@@ -905,6 +937,19 @@ class MoleculeEditor:
         self.last_canvas_pos = (event.x, event.y)
 
     # ----------------------------------------------------------- tool / keys
+    def _activate_reaction_tool(self):
+        """Activate the selected reaction symbol/text tool from its dropdown."""
+        self.tool.set(self.reaction_options[self.selected_reaction.get()])
+        self._tool_changed()
+        descriptions = {
+            "arrow": "Drag from the reaction arrow tail to its head.",
+            "equilibrium": "Drag from the left end to the right end of the equilibrium arrow.",
+            "plus": "Click the canvas to place a plus sign.",
+            "equals": "Click the canvas to place an equals sign.",
+            "text": "Click the canvas to add a text box; double-click an existing text box to edit it.",
+        }
+        self._set_status(descriptions.get(self.tool.get(), "Reaction tool selected."))
+
     def _tool_changed(self):
         self.draw_start = self.draw_atom = self.draw_bond = None
         cursor = {"select": "arrow", "move": "fleur", "erase": "X_cursor"}.get(self.tool.get(), "crosshair")
@@ -952,6 +997,21 @@ class MoleculeEditor:
         self.status_label.config(text=text)
 
     # ------------------------------------------------------------ mouse events
+    def on_double_click(self, event):
+        """Edit a placed text box or information annotation in place."""
+        annotation = self.find_annotation_at(event.x, event.y)
+        if annotation is None or annotation.kind not in ("text", "info"):
+            return
+        updated = simpledialog.askstring(
+            "Edit text box", "Text:", initialvalue=annotation.text, parent=self.root
+        )
+        if updated is None:
+            return
+        self.save_state()
+        annotation.text = updated
+        self._redraw_canvas(refresh_chemistry=False)
+        self._set_status("Text box updated. Use the Move tool to reposition it.")
+
     def on_click(self, event):
         self.canvas.focus_set()
         self.last_canvas_pos = (event.x, event.y)
@@ -989,6 +1049,9 @@ class MoleculeEditor:
             if pending[0] == "ring":
                 self.add_ring(pending[1], pending[2], placement=(event.x, event.y),
                               anchor_override=atom, fuse_bond=bond, explicit_placement=True)
+            elif pending[0] == "heteroring":
+                self.add_hetero_ring(pending[1], placement=(event.x, event.y),
+                                     anchor_override=atom)
             else:
                 self.add_functional_group(pending[1], placement=(event.x, event.y),
                                           anchor_override=atom, explicit_placement=True)
@@ -1195,10 +1258,10 @@ class MoleculeEditor:
             bond.order = bond.order % 3 + 1
             self.selected_bond = bond
         else:
-            r = math.radians(-30)
-            a1 = self._new_atom(x0, y0)
-            focus = self._new_atom(x0 + L * math.cos(r), y0 + L * math.sin(r))
-            self._link(a1, focus)
+            # A simple click on empty canvas starts a fresh isolated atom (a
+            # carbon with implicit hydrogens is CH4), not an automatic C-C bond.
+            # Drag to draw a bond, or click an existing atom to extend a chain.
+            focus = self._new_atom(x0, y0)
 
         self.selected_atoms = {focus} if focus else set()
         self._invalidate_validation()
@@ -1272,8 +1335,15 @@ class MoleculeEditor:
         return x, y
 
     def _request_selected_ring(self):
-        size, aromatic = self.ring_options[self.selected_ring.get()]
-        self.request_ring(size, aromatic)
+        choice = self.ring_options[self.selected_ring.get()]
+        if isinstance(choice, str):
+            self.pending_placement = ("heteroring", choice)
+            self.tool.set("draw")
+            self._tool_changed()
+            self._set_status(f"Choose where to place {choice}: click empty canvas or an atom to attach.")
+        else:
+            size, aromatic = choice
+            self.request_ring(size, aromatic)
 
     def _request_selected_group(self):
         group_type = self.group_options[self.selected_group.get()]
@@ -1403,41 +1473,124 @@ class MoleculeEditor:
                     x.order == 1 for x in bd.atom1.bonds + bd.atom2.bonds):
                 bd.order = 2
 
-    GROUPS = {"CH3": [("C", 0)], "OH": [("O", 0)], "NH2": [("N", 0)]}
+    # Fragment coordinates are in units of bond length in a local frame:
+    # +x points away from the parent structure and +y is perpendicular.
+    # Each fragment starts at atom 0, the atom bonded to the parent.
+    GROUP_TEMPLATES = {
+        "CH3": ([ ("C", 0, 0, 0) ], []),
+        "C2H5": ([ ("C",0,0,0), ("C",1,0,0) ], [(0,1,1)]),
+        "C3H7": ([ ("C",0,0,0), ("C",1,0,0), ("C",2,0,0) ], [(0,1,1),(1,2,1)]),
+        "iPr": ([ ("C",0,0,0), ("C",1,0.65,0), ("C",1,-0.65,0) ], [(0,1,1),(0,2,1)]),
+        "tBu": ([ ("C",0,0,0), ("C",1,0.65,0), ("C",1,-0.65,0), ("C",0,1.3,0) ], [(0,1,1),(0,2,1),(0,3,1)]),
+        "vinyl": ([ ("C",0,0,0), ("C",1,0,0) ], [(0,1,2)]),
+        "ethynyl": ([ ("C",0,0,0), ("C",1,0,0) ], [(0,1,3)]),
+        "OH": ([ ("O",0,0,0) ], []), "OMe": ([ ("O",0,0,0), ("C",1,0,0) ], [(0,1,1)]),
+        "OEt": ([ ("O",0,0,0), ("C",1,0,0), ("C",2,0.65,0) ], [(0,1,1),(1,2,1)]),
+        "NH2": ([ ("N",0,0,0) ], []),
+        "NMe2": ([ ("N",0,0,0), ("C",1,0.65,0), ("C",1,-0.65,0) ], [(0,1,1),(0,2,1)]),
+        "CONH2": ([ ("C",0,0,0), ("O",1,0.65,0), ("N",1,-0.65,0) ], [(0,1,2),(0,2,1)]),
+        "COCH3": ([ ("C",0,0,0), ("O",1,0.65,0), ("C",1,-0.65,0) ], [(0,1,2),(0,2,1)]),
+        "CHO": ([ ("C",0,0,0), ("O",1,0.65,0) ], [(0,1,2)]),
+        "COOH": ([ ("C",0,0,0), ("O",1,0.65,0), ("O",1,-0.65,0) ], [(0,1,2),(0,2,1)]),
+        "COOMe": ([ ("C",0,0,0), ("O",1,0.65,0), ("O",1,-0.65,0), ("C",2,-0.65,0) ], [(0,1,2),(0,2,1),(2,3,1)]),
+        "CN": ([ ("C",0,0,0), ("N",1,0,0) ], [(0,1,3)]),
+        # Nitro is drawn in a conventional charge-separated resonance form.
+        "NO2": ([ ("N",0,0,0,1), ("O",1,0.65,0,-1), ("O",1,-0.65,0,0) ], [(0,1,1),(0,2,2)]),
+        "F": ([ ("F",0,0,0) ], []), "Cl": ([ ("Cl",0,0,0) ], []),
+        "Br": ([ ("Br",0,0,0) ], []), "I": ([ ("I",0,0,0) ], []),
+        "SH": ([ ("S",0,0,0) ], []), "SMe": ([ ("S",0,0,0), ("C",1,0,0) ], [(0,1,1)]),
+        "SO3H": ([ ("S",0,0,0), ("O",1,0.65,0), ("O",1,-0.65,0), ("O",2,0,0) ], [(0,1,2),(0,2,2),(0,3,1)]),
+        "PO3H2": ([ ("P",0,0,0), ("O",1,0.65,0), ("O",1,-0.65,0), ("O",2,0,0) ], [(0,1,2),(0,2,1),(0,3,1)]),
+        "phenyl": ([ ("C",0,0,0), ("C",1,0,0), ("C",1.5,0.866,0), ("C",1,1.732,0), ("C",0,1.732,0), ("C",-0.5,0.866,0) ], [(0,1,2),(1,2,1),(2,3,2),(3,4,1),(4,5,2),(5,0,1)]),
+    }
+
+    HETERO_RINGS = {
+        "Cyclohexene": (["C"]*6, [2,1,1,1,1,1]),
+        "Cyclopentene": (["C"]*5, [2,1,1,1,1]),
+        "Cyclopentadiene": (["C"]*5, [2,1,2,1,1]),
+        "Pyridine": (["N","C","C","C","C","C"], [2,1,2,1,2,1]),
+        "Pyrimidine": (["N","C","N","C","C","C"], [2,1,2,1,2,1]),
+        "Pyrazine": (["N","C","C","N","C","C"], [2,1,2,1,2,1]),
+        "Pyridazine": (["N","N","C","C","C","C"], [1,2,1,2,1,2]),
+        "Furan": (["O","C","C","C","C"], [1,2,1,2,1]),
+        "Thiophene": (["S","C","C","C","C"], [1,2,1,2,1]),
+        "Pyrrole": (["N","C","C","C","C"], [1,2,1,2,1]),
+    }
+
+    def add_hetero_ring(self, name, placement=None, anchor_override=None):
+        if name not in self.HETERO_RINGS:
+            return
+        elements, orders = list(self.HETERO_RINGS[name][0]), list(self.HETERO_RINGS[name][1])
+        # If attached to a parent atom, attach through a ring carbon rather than
+        # accidentally creating a bond to pyridine/furan/thiophene heteroatoms.
+        if anchor_override is not None and "C" in elements and elements[0] != "C":
+            shift = elements.index("C")
+            elements = elements[shift:] + elements[:shift]
+            orders = orders[shift:] + orders[:shift]
+        n = len(elements)
+        L = self.BOND_LENGTH
+        R = L / (2 * math.sin(math.pi / n))
+        anchor = anchor_override
+        if anchor is not None:
+            ux, uy = self._auto_direction(anchor)
+            cx, cy = anchor.x + (L + R) * ux, anchor.y + (L + R) * uy
+            start = math.atan2(uy, ux) + math.pi
+        else:
+            x, y = placement or self.last_canvas_pos
+            cx, cy = (self._free_origin(x, y, R + 15)
+                      if self._clearance(x, y) < R * 0.55 else (x, y))
+            start = -math.pi / 2
+        self.save_state()
+        atoms = []
+        for i, element in enumerate(elements):
+            ang = start + 2 * math.pi * i / n
+            atoms.append(self._new_atom(cx + R * math.cos(ang), cy + R * math.sin(ang), element))
+        for i, order in enumerate(orders):
+            self.bonds.append(Bond(atoms[i], atoms[(i+1) % n], order))
+        if anchor is not None:
+            self.bonds.append(Bond(anchor, atoms[0], 1))
+        self.selected_atoms = {atoms[0]}
+        self.selected_bond = self.selected_annotation = None
+        self.tool.set("draw")
+        self._tool_changed()
+        self._invalidate_validation()
+        self._redraw_canvas()
+        self._set_status(f"{name} ring placed. Check structure to validate valence/aromaticity.")
 
     def add_functional_group(self, group_type, placement=None, anchor_override=None,
                             explicit_placement=False):
+        if group_type not in self.GROUP_TEMPLATES:
+            self._set_status(f"Unsupported group template: {group_type}")
+            return
         L = self.BOND_LENGTH
         anchor = anchor_override if explicit_placement else self._anchor_atom()
         if anchor is not None:
             ux, uy = self._auto_direction(anchor)
             gx, gy = anchor.x + L * ux, anchor.y + L * uy
         else:
-            if placement is not None:
-                x, y = placement
-            else:
-                x, y = self.last_canvas_pos
-                w, h = self._canvas_size()
-                if x < 5 or y < 5:
-                    x, y = w / 2, h / 2
-            gx, gy = (self._free_origin(x, y, L) if self._clearance(x, y) < L * 0.55
+            x, y = placement or self.last_canvas_pos
+            w, h = self._canvas_size()
+            if x < 5 or y < 5:
+                x, y = w / 2, h / 2
+            gx, gy = (self._free_origin(x, y, L * 2) if self._clearance(x, y) < L * 0.55
                       else (x, y))
             ux, uy = 1.0, 0.0
-        ang = math.atan2(uy, ux)
-
+        # Local coordinates are rotated to follow the selected attachment direction.
+        px, py = -uy, ux
+        atomspecs, bondspecs = self.GROUP_TEMPLATES[group_type]
         self.save_state()
-        if group_type in self.GROUPS:
-            focus = self._new_atom(gx, gy, self.GROUPS[group_type][0][0])
-        elif group_type == "COOH":
-            focus = self._new_atom(gx, gy, "C")
-            o1 = self._new_atom(gx + L * math.cos(ang + math.pi / 3),
-                                gy + L * math.sin(ang + math.pi / 3), "O")
-            o2 = self._new_atom(gx + L * math.cos(ang - math.pi / 3),
-                                gy + L * math.sin(ang - math.pi / 3), "O")
-            self.bonds.append(Bond(focus, o1, 2))
-            self.bonds.append(Bond(focus, o2, 1))
-        else:
-            return
+        created = []
+        for spec in atomspecs:
+            element, lx, ly = spec[:3]
+            charge = spec[4] if len(spec) > 4 else (spec[3] if len(spec) > 3 and isinstance(spec[3], int) else 0)
+            x = gx + L * (lx * ux + ly * px)
+            y = gy + L * (lx * uy + ly * py)
+            atom = self._new_atom(x, y, element)
+            atom.charge = charge
+            created.append(atom)
+        for i, j, order in bondspecs:
+            self.bonds.append(Bond(created[i], created[j], order))
+        focus = created[0]
         if anchor is not None:
             self.bonds.append(Bond(anchor, focus, 1))
         self.selected_atoms = {focus}
@@ -1446,7 +1599,7 @@ class MoleculeEditor:
         self._tool_changed()
         self._invalidate_validation()
         self._redraw_canvas()
-        self._set_status("Functional group placed. Bonds and charges were not auto-corrected.")
+        self._set_status("Functional-group fragment placed. Run Check structure to verify valence and charges.")
 
     def apply_charge(self):
         selected = [a for a in self.atoms if a in self.selected_atoms]
