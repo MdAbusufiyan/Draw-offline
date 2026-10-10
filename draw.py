@@ -302,6 +302,13 @@ class MoleculeEditor:
                                         padx=6, pady=6, state=tk.DISABLED)
         self.diagnostics_text.pack(fill=tk.BOTH, expand=True)
 
+        # Contextual, user-confirmed edit: never mutate chemistry just because a
+        # suggestion was detected. This button appears only for an unambiguous
+        # six-carbon ring with exocyclic C=C and ring double bonds.
+        self.suggestion_action_button = tk.Button(
+            panel, text="Apply suggested ring edit", command=self.apply_saturated_ring_suggestion,
+            padx=4, pady=3, takefocus=False)
+
         self.engine_label = tk.Label(
             panel,
             text=("Chemistry engine: RDKit" if RDKIT_AVAILABLE else
@@ -2394,6 +2401,122 @@ class MoleculeEditor:
         self.diagnostics_text.delete("1.0", tk.END)
         self.diagnostics_text.insert(tk.END, "\n\n".join(lines))
         self.diagnostics_text.config(state=tk.DISABLED)
+        self._refresh_suggestion_action()
+
+    def _saturated_ring_suggestions(self):
+        """Return safe, explicit saturation options for six-carbon exocyclic-alkene rings.
+
+        This is a user-invoked suggestion for cases like methyl-methylenecyclohexane.
+        Fused/shared-edge rings are excluded so one click cannot silently alter a
+        neighboring ring. The method does not change any bonds.
+        """
+        cycles = self._find_simple_cycles(max_size=8)
+        if not cycles:
+            return []
+
+        edge_use_count = defaultdict(int)
+        cycle_bonds = {}
+        for cycle in cycles:
+            edges = []
+            for i, atom in enumerate(cycle):
+                other = cycle[(i + 1) % len(cycle)]
+                bond = self._bond_for_atoms(atom, other)
+                if bond is None:
+                    edges = []
+                    break
+                edge = frozenset((atom, other))
+                edges.append((edge, bond))
+                edge_use_count[edge] += 1
+            cycle_bonds[tuple(cycle)] = edges
+
+        candidates = []
+        seen = set()
+        for cycle in cycles:
+            if len(cycle) != 6 or any(atom.element != "C" for atom in cycle):
+                continue
+            edges = cycle_bonds.get(tuple(cycle), [])
+            if len(edges) != 6:
+                continue
+            # Do not offer bulk saturation for fused/bridged drawings where a
+            # ring edge is also part of another detected cycle.
+            if any(edge_use_count[edge] > 1 for edge, _bond in edges):
+                continue
+            ring_bonds = [bond for _edge, bond in edges]
+            if any(bond.order not in (1, 2) for bond in ring_bonds):
+                continue
+            ring_double_bonds = [bond for bond in ring_bonds if bond.order == 2]
+            if not ring_double_bonds:
+                continue
+
+            cycle_set = set(cycle)
+            for ring_atom in cycle:
+                for external_bond in ring_atom.bonds:
+                    if external_bond.order != 2:
+                        continue
+                    external_atom = (external_bond.atom2 if external_bond.atom1 is ring_atom
+                                     else external_bond.atom1)
+                    if external_atom in cycle_set or external_atom.element != "C":
+                        continue
+                    # Use the external bond as part of the key to avoid duplicate
+                    # recommendations for the same ring/external alkene pair.
+                    key = (frozenset(cycle), frozenset((ring_atom, external_atom)))
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    candidates.append({
+                        "cycle": tuple(cycle),
+                        "ring_bonds": tuple(ring_bonds),
+                        "double_bonds": tuple(ring_double_bonds),
+                        "ring_atom": ring_atom,
+                        "external_atom": external_atom,
+                        "external_bond": external_bond,
+                    })
+        return candidates
+
+    def _refresh_suggestion_action(self):
+        """Show the optional action only when there is one unambiguous candidate."""
+        if not hasattr(self, "suggestion_action_button") or not hasattr(self, "engine_label"):
+            return
+        candidates = self._saturated_ring_suggestions()
+        if len(candidates) == 1:
+            count = len(candidates[0]["double_bonds"])
+            self.suggestion_action_button.config(
+                text=f"Make ring saturated ({count} bond{'s' if count != 1 else ''})")
+            if not self.suggestion_action_button.winfo_manager():
+                self.suggestion_action_button.pack(fill=tk.X, pady=(0, 5), before=self.engine_label)
+        elif self.suggestion_action_button.winfo_manager():
+            self.suggestion_action_button.pack_forget()
+
+    def apply_saturated_ring_suggestion(self):
+        """Apply the proposed ring saturation only after an explicit user click/confirmation."""
+        candidates = self._saturated_ring_suggestions()
+        if len(candidates) != 1:
+            self._set_status("No single, unambiguous saturated-ring suggestion is available.")
+            self._refresh_suggestion_action()
+            return
+
+        candidate = candidates[0]
+        double_bonds = candidate["double_bonds"]
+        if not double_bonds:
+            return
+        message = (
+            f"Change {len(double_bonds)} double bond(s) inside this six-carbon ring to single bonds?\n\n"
+            "The external C=C, atom positions, substituents and charges will be preserved.\n"
+            "This is an explicit edit, not an automatic correction, and can be undone."
+        )
+        if not messagebox.askyesno("Apply suggested ring edit", message, parent=self.root):
+            return
+
+        self.save_state()
+        for bond in double_bonds:
+            bond.order = 1
+        self.selected_bond = None
+        self._invalidate_validation()
+        self._redraw_canvas()
+        self._set_status(
+            f"Applied your choice: changed {len(double_bonds)} in-ring double bond(s) to single; "
+            "the external C=C was preserved. Use Undo to revert."
+        )
 
 
 def main():
