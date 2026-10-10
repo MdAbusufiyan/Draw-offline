@@ -573,6 +573,7 @@ class MoleculeEditor:
                     notes.append("Suggestion (not applied): inspect the bond type and the intended atom identities.")
                 if not self.invalid_atom_indices:
                     self.invalid_atom_indices.update(self._heuristic_suspects())
+
         else:
             suspect = self._heuristic_suspects()
             if unusual_bonds:
@@ -589,6 +590,15 @@ class MoleculeEditor:
                 self.validation_state = "limited"
                 notes.insert(0, "No obvious valence issue found by the basic checks; this is not a full validation.")
             notes.append("Install RDKit for stronger chemistry validation, aromaticity handling and canonical SMILES.")
+
+        # Give a drawing-specific suggestion for a common sketching mistake:
+        # adding an exocyclic multiple bond to a ring carbon while leaving the
+        # adjacent Kekule double bond in place. This is advice only. In keeping
+        # with the editor's non-destructive contract, never alter a bond here.
+        ring_bond_hint = self._exocyclic_multiple_bond_suggestion(
+            self.invalid_atom_indices)
+        if ring_bond_hint:
+            notes.append(ring_bond_hint)
 
         if geometry_note:
             notes.append(geometry_note)
@@ -1856,6 +1866,18 @@ class MoleculeEditor:
             except (KeyError, RuntimeError, AttributeError):
                 pass
 
+        # If sanitization failed (often because an exocyclic double bond was
+        # drawn on a still-Kekulized benzene carbon), do not use the alternating
+        # six-membered-ring fallback to show an aromatic circle. The circle is
+        # reserved for a graph that supports aromaticity; an invalid graph must
+        # show its literal bonds so the conflict is visible to the user.
+        cycle_atoms = set(cycle)
+        for atom in cycle:
+            for bond in atom.bonds:
+                neighbour = bond.atom2 if bond.atom1 is atom else bond.atom1
+                if neighbour not in cycle_atoms and bond.order > 1:
+                    return False
+
         if len(cycle) != 6 or any(atom.element not in ("C", "N") for atom in cycle):
             return False
         orders = []
@@ -1866,6 +1888,50 @@ class MoleculeEditor:
             orders.append(bond.order)
         return (sum(order == 2 for order in orders) == 3 and
                 all(orders[i] != orders[(i + 1) % 6] for i in range(6)))
+
+    def _exocyclic_multiple_bond_suggestion(self, suspect_indices):
+        """Suggest a manual ring-bond review for an over-valent ring attachment.
+
+        Only emits advice when the suspect ring atom has (a) a multiple bond to
+        an atom outside the ring and (b) a ring double bond incident to that same
+        atom. The graph is not changed. RDKit is the authority on validity; this
+        helper only explains a common possible cause.
+        """
+        if not suspect_indices:
+            return None
+        suspected_atoms = {
+            self.atoms[i] for i in suspect_indices
+            if 0 <= i < len(self.atoms)
+        }
+        atom_index = {atom: i + 1 for i, atom in enumerate(self.atoms)}
+        cycles = self._find_simple_cycles(max_size=8)
+        for cycle in cycles:
+            cycle_atoms = set(cycle)
+            for atom in cycle:
+                if atom not in suspected_atoms:
+                    continue
+                external_multiple = []
+                ring_double = []
+                for bond in atom.bonds:
+                    neighbour = bond.atom2 if bond.atom1 is atom else bond.atom1
+                    if neighbour in cycle_atoms:
+                        if bond.order == 2:
+                            ring_double.append(bond)
+                    elif bond.order > 1:
+                        external_multiple.append(bond)
+                if external_multiple and ring_double:
+                    idx = atom_index[atom]
+                    return (
+                        f"Possible ring/exocyclic double-bond conflict at atom {idx}: "
+                        "this ring atom has a multiple bond to an external atom and "
+                        "still has a ring double bond. If an exocyclic alkene is "
+                        "intended, inspect the ring double bond directly attached "
+                        "to this same atom; changing that bond to single may be "
+                        "needed for the intended structure. The ring is not shown "
+                        "as aromatic while this pattern is present. This is only "
+                        "a suggestion—no bonds were changed."
+                    )
+        return None
 
     def _cycle_centroid(self, cycle):
         return (sum(atom.x for atom in cycle) / len(cycle),
