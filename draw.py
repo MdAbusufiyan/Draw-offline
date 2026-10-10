@@ -244,7 +244,7 @@ class MoleculeEditor:
             "Pyrazine": "Pyrazine", "Pyridazine": "Pyridazine",
             "Furan": "Furan", "Thiophene": "Thiophene", "Pyrrole": "Pyrrole",
         }
-        self.selected_ring = tk.StringVar(value="Benzene")
+        self.selected_ring = tk.StringVar(value="Benzene (aromatic)")
         ttk.Combobox(second, textvariable=self.selected_ring,
                      values=list(self.ring_options), state="readonly", width=14).pack(
                          side=tk.LEFT, padx=(0, 3))
@@ -1050,8 +1050,14 @@ class MoleculeEditor:
                 self.add_ring(pending[1], pending[2], placement=(event.x, event.y),
                               anchor_override=atom, fuse_bond=bond, explicit_placement=True)
             elif pending[0] == "heteroring":
-                self.add_hetero_ring(pending[1], placement=(event.x, event.y),
-                                     anchor_override=atom)
+                if bond is not None:
+                    # Heterorings are not fused by the carbocycle fusion routine:
+                    # placing one beside the bond is safer than corrupting bond orders.
+                    self.add_hetero_ring(pending[1], placement=(event.x, event.y))
+                    self._set_status(f"{pending[1]} placed separately. Heteroring fusion is not supported yet; click an atom to attach it or blank canvas to place it freely.")
+                else:
+                    self.add_hetero_ring(pending[1], placement=(event.x, event.y),
+                                         anchor_override=atom)
             else:
                 self.add_functional_group(pending[1], placement=(event.x, event.y),
                                           anchor_override=atom, explicit_placement=True)
@@ -1335,7 +1341,17 @@ class MoleculeEditor:
         return x, y
 
     def _request_selected_ring(self):
-        choice = self.ring_options[self.selected_ring.get()]
+        # Keep the dropdown selection and template dictionary in sync. Older
+        # saved/UI defaults used "Benzene", while the current label is
+        # "Benzene (aromatic)"; accept that legacy value without crashing.
+        selected = self.selected_ring.get().strip()
+        if selected not in self.ring_options:
+            legacy_aliases = {
+                "Benzene": "Benzene (aromatic)",
+            }
+            selected = legacy_aliases.get(selected, "Benzene (aromatic)")
+            self.selected_ring.set(selected)
+        choice = self.ring_options[selected]
         if isinstance(choice, str):
             self.pending_placement = ("heteroring", choice)
             self.tool.set("draw")
@@ -1353,13 +1369,15 @@ class MoleculeEditor:
         self.pending_placement = ("ring", int(size), bool(aromatic))
         self.tool.set("draw")
         self._tool_changed()
-        self._set_status(f"Choose where to place the {size}-membered ring: click empty canvas, an atom to attach, or a bond to fuse.")
+        self.selected_bond = self.selected_annotation = None
+        self._set_status(f"Place ring: click blank space for a new ring, an atom to attach, or a bond to fuse. Esc cancels.")
 
     def request_functional_group(self, group_type):
         self.pending_placement = ("group", str(group_type))
         self.tool.set("draw")
         self._tool_changed()
-        self._set_status(f"Choose where to place {group_type}: click empty canvas to place, or an atom to attach.")
+        self.selected_bond = self.selected_annotation = None
+        self._set_status(f"Place group: click blank space for a separate fragment, or an atom to attach. Esc cancels.")
 
     def add_ring(self, size, aromatic=False, placement=None, anchor_override=None,
                  fuse_bond=None, explicit_placement=False):
@@ -1396,8 +1414,10 @@ class MoleculeEditor:
         for i in range(size):
             ang = start + i * 2 * math.pi / size
             px, py = cx + R * math.cos(ang), cy + R * math.sin(ang)
-            existing = self.find_atom_at(px, py, 8)
-            ring.append(existing or self._new_atom(px, py, "C"))
+            # Free placement creates a self-contained ring. Do not silently
+            # reuse nearby atoms; attachment/fusion only happens when the user
+            # explicitly clicks an atom or bond.
+            ring.append(self._new_atom(px, py, "C"))
         self._close_ring(ring, aromatic)
         if anchor is not None and ring[0] is not anchor:
             if not any(b.other(anchor) is ring[0] for b in anchor.bonds):
