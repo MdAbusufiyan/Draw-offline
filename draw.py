@@ -106,8 +106,8 @@ class MoleculeEditor:
 
     TOOL_HELP = {
         "draw": "Draw: click blank for an atom; click an atom then a target to connect. Esc clears the anchor for a separate fragment.",
-        "select": "Select: click an atom, bond or annotation. Shift-click adds/removes atoms from selection.",
-        "move": "Move: drag a molecule fragment or a reaction annotation.",
+        "select": "Select: click an atom/bond, or drag a box around atoms. Shift-click or Shift-drag adds to selection.",
+        "move": "Move: drag any selected atom to move its whole connected molecule; box-select can move several fragments.",
         "erase": "Erase: click an atom, bond or annotation. Right-click also erases.",
         "arrow": "Reaction arrow: drag from the tail to the arrowhead.",
         "equilibrium": "Equilibrium arrow: drag from left to right.",
@@ -157,6 +157,9 @@ class MoleculeEditor:
         self.move_before_state = None
         self.move_undo_saved = False
         self.moving_annotation = None
+        self.selection_start = None
+        self.selection_additive = False
+        self.selection_base_atoms = set()
 
         # Chemistry analysis cache. It never writes changes back into the graph.
         self.chem_mol = None
@@ -185,6 +188,7 @@ class MoleculeEditor:
         for order, label in ((1, "—"), (2, "="), (3, "≡")):
             tk.Radiobutton(top, text=label, variable=self.bond_order, value=order,
                            indicatoron=False, width=3, padx=2, pady=1,
+                           command=self._bond_order_changed,
                            takefocus=False).pack(side=tk.LEFT, padx=1)
 
         ttk.Separator(top, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=7)
@@ -758,10 +762,46 @@ class MoleculeEditor:
         self.last_canvas_pos = (event.x, event.y)
 
     # ------------------------------------------------------------ draw events
+    def _bond_order_changed(self):
+        """Apply an explicitly chosen order to the selected bond, if any."""
+        bond = self.selected_bond
+        if bond is None or bond not in self.bonds:
+            return
+        new_order = int(self.bond_order.get())
+        if bond.order == new_order:
+            return
+        old_order = bond.order
+        self.save_state()
+        bond.order = new_order
+        self._invalidate_validation()
+        self._redraw_canvas()
+        labels = {1: "single", 2: "double", 3: "triple"}
+        self._set_status(
+            f"Selected bond changed from {labels.get(old_order, old_order)} to "
+            f"{labels.get(new_order, new_order)} by your choice. Run Check structure to review it."
+        )
+
+    def _component_union(self, seeds):
+        """Return unique connected components reached from a collection of atoms."""
+        result = []
+        seen = set()
+        for seed in seeds:
+            if seed not in self.atoms:
+                continue
+            for atom in self.get_connected_component(seed):
+                if atom not in seen:
+                    seen.add(atom)
+                    result.append(atom)
+        return result
+
     def _tool_changed(self):
         if self.tool.get() != "draw":
             self.pending_bond_atom = None
             self.drag_start_atom = None
+        if self.tool.get() != "select" and self.selection_start is not None:
+            self.selection_start = None
+            self.selection_base_atoms.clear()
+            self._clear_temp_preview()
         cursor = "crosshair"
         if self.tool.get() == "select":
             cursor = "arrow"
@@ -812,6 +852,15 @@ class MoleculeEditor:
                 self._redraw_canvas(refresh_chemistry=False)
             return
 
+        if mode == "select":
+            self.pending_bond_atom = None
+            self.drag_start_atom = None
+            self.selection_start = (event.x, event.y)
+            self.selection_additive = bool(event.state & 0x0001)  # Shift
+            self.selection_base_atoms = set(self.selected_atoms) if self.selection_additive else set()
+            self._clear_temp_preview()
+            return
+
         atom = self.find_atom_at(event.x, event.y)
         bond = None if atom else self.find_bond_at(event.x, event.y)
         annotation = None if atom or bond else self.find_annotation_at(event.x, event.y)
@@ -849,33 +898,6 @@ class MoleculeEditor:
                     self._invalidate_validation()
                     self._redraw_canvas()
 
-        elif mode == "select":
-            self.pending_bond_atom = None
-            self.drag_start_atom = None
-            if atom is not None:
-                if event.state & 0x0001:
-                    if atom in self.selected_atoms:
-                        self.selected_atoms.remove(atom)
-                    else:
-                        self.selected_atoms.add(atom)
-                else:
-                    self.selected_atoms = {atom}
-                self.selected_bond = None
-                self.selected_annotation = None
-            elif bond is not None:
-                self.selected_atoms.clear()
-                self.selected_bond = bond
-                self.selected_annotation = None
-            elif annotation is not None:
-                self.selected_atoms.clear()
-                self.selected_bond = None
-                self.selected_annotation = annotation
-            else:
-                self.selected_atoms.clear()
-                self.selected_bond = None
-                self.selected_annotation = None
-            self._redraw_canvas(refresh_chemistry=False)
-
         elif mode == "erase":
             if atom is not None or bond is not None or annotation is not None:
                 self.save_state()
@@ -892,16 +914,25 @@ class MoleculeEditor:
             self.move_before_state = self._capture_state()
             self.moving_annotation = None
             if atom is not None:
-                self.selected_atoms = {atom}
+                if atom in self.selected_atoms and len(self.selected_atoms) > 1:
+                    move_seeds = list(self.selected_atoms)
+                else:
+                    self.selected_atoms = {atom}
+                    move_seeds = [atom]
                 self.selected_bond = None
                 self.selected_annotation = None
-                self.move_component = self.get_connected_component(atom)
+                self.move_component = self._component_union(move_seeds)
                 self.drag_start_atom = atom
             elif bond is not None:
-                self.selected_atoms = {bond.atom1}
+                if self.selected_atoms and (bond.atom1 in self.selected_atoms or
+                                            bond.atom2 in self.selected_atoms):
+                    move_seeds = list(self.selected_atoms)
+                else:
+                    self.selected_atoms = {bond.atom1}
+                    move_seeds = [bond.atom1]
                 self.selected_bond = None
                 self.selected_annotation = None
-                self.move_component = self.get_connected_component(bond.atom1)
+                self.move_component = self._component_union(move_seeds)
                 self.drag_start_atom = bond.atom1
             elif annotation is not None:
                 self.selected_atoms.clear()
@@ -922,6 +953,15 @@ class MoleculeEditor:
         self.last_canvas_pos = (event.x, event.y)
         if self.annotation_start is not None and self.tool.get() in ("arrow", "equilibrium"):
             self._draw_annotation_preview(event.x, event.y)
+            return
+
+        if self.tool.get() == "select" and self.selection_start is not None:
+            x1, y1 = self.selection_start
+            if math.hypot(event.x - x1, event.y - y1) >= 4:
+                self._clear_temp_preview()
+                self.temp_ids.append(self.canvas.create_rectangle(
+                    x1, y1, event.x, event.y,
+                    outline="#2674D9", width=1, dash=(4, 3), fill=""))
             return
 
         if self.tool.get() == "draw" and self.drag_start_atom is not None:
@@ -963,6 +1003,66 @@ class MoleculeEditor:
                 self.save_state()
                 self.annotations.append(Annotation(self.tool.get(), x1, y1, event.x, event.y))
                 self._redraw_canvas(refresh_chemistry=False)
+            return
+
+        if self.tool.get() == "select" and self.selection_start is not None:
+            x1, y1 = self.selection_start
+            dragged = math.hypot(event.x - x1, event.y - y1) >= 5
+            if dragged:
+                left, right = sorted((x1, event.x))
+                top, bottom = sorted((y1, event.y))
+                in_box = {atom for atom in self.atoms
+                          if left <= atom.x <= right and top <= atom.y <= bottom}
+                self.selected_atoms = (self.selection_base_atoms | in_box
+                                       if self.selection_additive else in_box)
+                self.selected_bond = None
+                self.selected_annotation = None
+                if self.selected_atoms:
+                    self._set_status(
+                        f"Selected {len(self.selected_atoms)} atom(s). Choose Move and drag a selected atom to move the connected fragment(s)."
+                    )
+                else:
+                    self._set_status("No atoms inside selection box.")
+            else:
+                atom = self.find_atom_at(event.x, event.y)
+                bond = None if atom else self.find_bond_at(event.x, event.y)
+                annotation = None if atom or bond else self.find_annotation_at(event.x, event.y)
+                if atom is not None:
+                    if self.selection_additive:
+                        self.selected_atoms = set(self.selection_base_atoms)
+                        if atom in self.selected_atoms:
+                            self.selected_atoms.remove(atom)
+                        else:
+                            self.selected_atoms.add(atom)
+                    else:
+                        self.selected_atoms = {atom}
+                    self.selected_bond = None
+                    self.selected_annotation = None
+                    self._set_status(f"Selected atom: {atom.element}. Shift-click to add or remove atoms.")
+                elif bond is not None:
+                    self.selected_atoms.clear()
+                    self.selected_bond = bond
+                    self.selected_annotation = None
+                    self.bond_order.set(bond.order)
+                    self._set_status(
+                        f"Selected {('single', 'double', 'triple')[bond.order - 1]} bond. "
+                        "Click —, =, or ≡ to change this bond explicitly."
+                    )
+                elif annotation is not None:
+                    self.selected_atoms.clear()
+                    self.selected_bond = None
+                    self.selected_annotation = annotation
+                    self._set_status("Selected reaction annotation. Use Move to drag it.")
+                else:
+                    self.selected_atoms.clear()
+                    self.selected_bond = None
+                    self.selected_annotation = None
+                    self._set_status("Selection cleared.")
+
+            self.selection_start = None
+            self.selection_base_atoms.clear()
+            self._clear_temp_preview()
+            self._redraw_canvas(refresh_chemistry=False)
             return
 
         self._clear_temp_preview()
@@ -1031,6 +1131,8 @@ class MoleculeEditor:
         self.move_component = []
         self.move_last = None
         self.moving_annotation = None
+        self.selection_start = None
+        self.selection_base_atoms.clear()
         self.selected_atoms.clear()
         self.selected_bond = None
         self.selected_annotation = None
