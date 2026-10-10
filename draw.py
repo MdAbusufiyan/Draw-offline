@@ -228,18 +228,31 @@ class MoleculeEditor:
         second = tk.Frame(self.root, padx=5, pady=4, relief=tk.GROOVE, borderwidth=1)
         second.pack(side=tk.TOP, fill=tk.X)
 
-        tk.Label(second, text="Rings").pack(side=tk.LEFT, padx=(2, 4))
-        for label, size, arom in (("Benzene", 6, True), ("Cyclohexane", 6, False),
-                                  ("Cyclopentane", 5, False), ("Cyclopropane", 3, False),
-                                  ("Cyclobutane", 4, False), ("Cycloheptane", 7, False)):
-            tk.Button(second, text=label,
-                      command=lambda s=size, a=arom: self.request_ring(s, a)).pack(side=tk.LEFT, padx=2)
+        tk.Label(second, text="Ring").pack(side=tk.LEFT, padx=(2, 4))
+        self.ring_options = {
+            "Benzene": (6, True),
+            "Cyclohexane": (6, False),
+            "Cyclopentane": (5, False),
+            "Cyclopropane": (3, False),
+            "Cyclobutane": (4, False),
+            "Cycloheptane": (7, False),
+        }
+        self.selected_ring = tk.StringVar(value="Benzene")
+        ttk.Combobox(second, textvariable=self.selected_ring,
+                     values=list(self.ring_options), state="readonly", width=14).pack(
+                         side=tk.LEFT, padx=(0, 3))
+        tk.Button(second, text="Place ring", command=self._request_selected_ring).pack(
+            side=tk.LEFT, padx=(0, 8))
 
         ttk.Separator(second, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=7)
-        tk.Label(second, text="Groups").pack(side=tk.LEFT, padx=(0, 4))
-        for label, group in (("CH₃", "CH3"), ("OH", "OH"), ("NH₂", "NH2"), ("COOH", "COOH")):
-            tk.Button(second, text=label,
-                      command=lambda g=group: self.request_functional_group(g)).pack(side=tk.LEFT, padx=2)
+        tk.Label(second, text="Group").pack(side=tk.LEFT, padx=(0, 4))
+        self.group_options = {"CH₃": "CH3", "OH": "OH", "NH₂": "NH2", "COOH": "COOH"}
+        self.selected_group = tk.StringVar(value="CH₃")
+        ttk.Combobox(second, textvariable=self.selected_group,
+                     values=list(self.group_options), state="readonly", width=7).pack(
+                         side=tk.LEFT, padx=(0, 3))
+        tk.Button(second, text="Place group", command=self._request_selected_group).pack(
+            side=tk.LEFT, padx=(0, 8))
 
         ttk.Separator(second, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=7)
         tk.Label(second, text="Reaction").pack(side=tk.LEFT, padx=(0, 3))
@@ -1257,6 +1270,14 @@ class MoleculeEditor:
                 if self._clearance(px, py) > radius_needed:
                     return px, py
         return x, y
+
+    def _request_selected_ring(self):
+        size, aromatic = self.ring_options[self.selected_ring.get()]
+        self.request_ring(size, aromatic)
+
+    def _request_selected_group(self):
+        group_type = self.group_options[self.selected_group.get()]
+        self.request_functional_group(group_type)
 
     def request_ring(self, size, aromatic=False):
         self.pending_placement = ("ring", int(size), bool(aromatic))
