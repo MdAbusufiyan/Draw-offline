@@ -44,6 +44,14 @@ COMMON_VALENCES = {
 HALOGENS = {"F", "Cl", "Br", "I"}
 SUBSCRIPTS = str.maketrans("0123456789", "₀₁₂₃₄₅₆₇₈₉")
 
+# Common, readable element colours used in skeletal drawing. Carbon and hydrogen
+# remain black; a suspected-invalid atom is still highlighted separately.
+ELEMENT_COLOURS = {
+    "C": "#202124", "H": "#202124", "N": "#1D4ED8",
+    "O": "#C62828", "S": "#9A6700", "P": "#C2410C",
+    "F": "#238636", "Cl": "#238636", "Br": "#8B4513", "I": "#7E22CE",
+}
+
 
 class Atom:
     """One chemical atom. Coordinates are display-only; bonds define chemistry."""
@@ -141,6 +149,11 @@ class MoleculeEditor:
         self.bond_order = tk.IntVar(value=1)
         self.tool = tk.StringVar(value="draw")
         self.charge_value = tk.IntVar(value=0)
+        # Aromatic-circle mode changes only how eligible rings are displayed;
+        # the underlying single/double bond graph is never changed.
+        self.aromatic_circle = tk.BooleanVar(value=True)
+        self._drawing_cycles = []
+        self._aromatic_display_bonds = set()
         self.selected_atoms = set()
         self.selected_bond = None
         self.selected_annotation = None
@@ -235,8 +248,12 @@ class MoleculeEditor:
         tk.Spinbox(third, from_=-3, to=3, width=4, textvariable=self.charge_value).pack(side=tk.LEFT)
         tk.Button(third, text="Apply to selected atom(s)", command=self.apply_charge).pack(
             side=tk.LEFT, padx=5)
-        tk.Label(third, text="Charge edits are explicit. Check structure never changes your drawing.",
-                 fg="#5B6573").pack(side=tk.LEFT, padx=8)
+        ttk.Separator(third, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=7)
+        ttk.Checkbutton(third, text="Aromatic rings as circle",
+                        variable=self.aromatic_circle,
+                        command=self._redraw_canvas).pack(side=tk.LEFT, padx=(0, 8))
+        tk.Label(third, text="Visual style only; checking never edits your drawing.",
+                 fg="#5B6573").pack(side=tk.LEFT, padx=4)
 
         main = tk.Frame(self.root)
         main.pack(expand=True, fill=tk.BOTH)
@@ -1367,6 +1384,104 @@ class MoleculeEditor:
         self._set_status("Formal charge changed by user. Run Check structure to review it.")
 
     # ------------------------------------------------------------ canvas draw
+    def _find_simple_cycles(self, max_size=8):
+        """Find unique simple cycles up to max_size for drawing geometry only."""
+        atom_index = {atom: i for i, atom in enumerate(self.atoms)}
+        found = {}
+
+        def canonical_key(path):
+            seq = tuple(atom_index[a] for a in path)
+            reverse = (seq[0],) + tuple(reversed(seq[1:]))
+            return min(seq, reverse)
+
+        for start in self.atoms:
+            start_index = atom_index[start]
+
+            def visit(current, path, path_set):
+                if len(path) > max_size:
+                    return
+                for bond in current.bonds:
+                    neighbour = bond.atom2 if bond.atom1 is current else bond.atom1
+                    if neighbour is start and len(path) >= 3:
+                        key = canonical_key(path)
+                        found.setdefault(key, list(path))
+                    elif (neighbour not in path_set and
+                          atom_index[neighbour] > start_index and
+                          len(path) < max_size):
+                        visit(neighbour, path + [neighbour], path_set | {neighbour})
+
+            visit(start, [start], {start})
+        return sorted(found.values(), key=lambda cycle: (len(cycle), tuple(atom_index[a] for a in cycle)))
+
+    @staticmethod
+    def _bond_for_atoms(atom1, atom2):
+        for bond in atom1.bonds:
+            if ((bond.atom1 is atom1 and bond.atom2 is atom2) or
+                    (bond.atom1 is atom2 and bond.atom2 is atom1)):
+                return bond
+        return None
+
+    def _eligible_aromatic_cycle(self, cycle):
+        """Return whether the current graph supports aromatic-circle display.
+
+        When RDKit has sanitized the unchanged drawing, use its aromatic bond flags
+        for 5- to 7-membered rings (including heteroaromatics). Without RDKit, use
+        a deliberately narrow alternating six-membered-ring fallback. This affects
+        rendering only; it never changes the editor's bond orders.
+        """
+        if not 5 <= len(cycle) <= 7:
+            return False
+
+        if RDKIT_AVAILABLE and self.chem_mol is not None:
+            atom_index = {atom: i for i, atom in enumerate(self.atoms)}
+            try:
+                for i, atom in enumerate(cycle):
+                    j_atom = cycle[(i + 1) % len(cycle)]
+                    rd_bond = self.chem_mol.GetBondBetweenAtoms(
+                        atom_index[atom], atom_index[j_atom])
+                    if rd_bond is None or not rd_bond.GetIsAromatic():
+                        return False
+                return True
+            except (KeyError, RuntimeError, AttributeError):
+                pass
+
+        if len(cycle) != 6 or any(atom.element not in ("C", "N") for atom in cycle):
+            return False
+        orders = []
+        for i, atom in enumerate(cycle):
+            bond = self._bond_for_atoms(atom, cycle[(i + 1) % len(cycle)])
+            if bond is None or bond.order not in (1, 2):
+                return False
+            orders.append(bond.order)
+        return (sum(order == 2 for order in orders) == 3 and
+                all(orders[i] != orders[(i + 1) % 6] for i in range(6)))
+
+    def _cycle_centroid(self, cycle):
+        return (sum(atom.x for atom in cycle) / len(cycle),
+                sum(atom.y for atom in cycle) / len(cycle))
+
+    def _inner_normal_sign(self, bond, x1, y1, x2, y2, px, py):
+        """Choose the normal pointing into the smallest ring containing a bond."""
+        candidates = [cycle for cycle in self._drawing_cycles
+                      if bond.atom1 in cycle and bond.atom2 in cycle]
+        if not candidates:
+            return 0
+        cycle = min(candidates, key=len)
+        cx, cy = self._cycle_centroid(cycle)
+        mx, my = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+        dot = (cx - mx) * px + (cy - my) * py
+        return 1 if dot >= 0 else -1
+
+    def _draw_aromatic_circle(self, cycle):
+        cx, cy = self._cycle_centroid(cycle)
+        mean_radius = sum(math.hypot(atom.x - cx, atom.y - cy) for atom in cycle) / len(cycle)
+        # Keep the circle comfortably inside the ring's inner perimeter.
+        radius = max(8.0, mean_radius * 0.52)
+        colour = "#2674D9" if all(atom in self.selected_atoms for atom in cycle) else "#202124"
+        self.canvas.create_oval(cx - radius, cy - radius, cx + radius, cy + radius,
+                                outline=colour, width=2 if colour == "#2674D9" else 1.8,
+                                fill="")
+
     def _redraw_canvas(self, refresh_chemistry=True):
         if refresh_chemistry:
             self._refresh_chemistry_cache()
@@ -1379,11 +1494,27 @@ class MoleculeEditor:
         for annotation in self.annotations:
             annotation.canvas_ids = []
 
+        self._drawing_cycles = self._find_simple_cycles(max_size=8)
+        aromatic_cycles = []
+        self._aromatic_display_bonds = set()
+        if self.aromatic_circle.get():
+            aromatic_cycles = [cycle for cycle in self._drawing_cycles
+                               if self._eligible_aromatic_cycle(cycle)]
+            for cycle in aromatic_cycles:
+                for i, atom in enumerate(cycle):
+                    bond = self._bond_for_atoms(atom, cycle[(i + 1) % len(cycle)])
+                    if bond is not None:
+                        self._aromatic_display_bonds.add(bond)
+
         # Annotation layer first: reaction arrows sit behind molecular structures.
         for annotation in self.annotations:
             self._draw_annotation(annotation)
         for bond in self.bonds:
             self._draw_bond(bond)
+        # The aromatic circle is a display convention only. Underlying Kekule
+        # single/double orders remain intact for editing, formulas and validation.
+        for cycle in aromatic_cycles:
+            self._draw_aromatic_circle(cycle)
         for atom in self.atoms:
             self._draw_atom(atom)
         self._update_panel()
@@ -1414,7 +1545,7 @@ class MoleculeEditor:
             self.canvas.create_oval(atom.x - width / 2, atom.y - 11,
                                     atom.x + width / 2, atom.y + 11,
                                     fill="white", outline="white")
-            colour = "#B42318" if suspect else "#202124"
+            colour = "#B42318" if suspect else ELEMENT_COLOURS.get(atom.element, "#202124")
             atom.text_id = self.canvas.create_text(
                 atom.x, atom.y, text=label, font=("Arial", 11, "bold"), fill=colour)
 
@@ -1445,27 +1576,48 @@ class MoleculeEditor:
         colour = "#2674D9" if selected else "#202124"
         width = 3 if selected else 2
         px, py = -uy, ux
+
+        # In aromatic-circle mode, draw the perimeter as single strokes and add
+        # the aromatic circle after all bond strokes. Bond.order is not modified.
+        if bond in self._aromatic_display_bonds:
+            bond.canvas_ids.append(self.canvas.create_line(
+                x1, y1, x2, y2, fill=colour, width=width, capstyle=tk.ROUND))
+            return
+
         if bond.order == 1:
             bond.canvas_ids.append(self.canvas.create_line(
                 x1, y1, x2, y2, fill=colour, width=width, capstyle=tk.ROUND))
         elif bond.order == 2:
             offset = 3.0
-            bond.canvas_ids.append(self.canvas.create_line(
-                x1 + px * offset, y1 + py * offset, x2 + px * offset, y2 + py * offset,
-                fill=colour, width=width))
-            bond.canvas_ids.append(self.canvas.create_line(
-                x1 - px * offset, y1 - py * offset, x2 - px * offset, y2 - py * offset,
-                fill=colour, width=width))
+            # For double bonds inside a ring, retain the outer edge and offset
+            # the second stroke toward the ring interior. Outside rings, use the
+            # conventional centered pair of parallel lines.
+            inner_sign = self._inner_normal_sign(bond, x1, y1, x2, y2, px, py)
+            if inner_sign:
+                bond.canvas_ids.append(self.canvas.create_line(
+                    x1, y1, x2, y2, fill=colour, width=width, capstyle=tk.ROUND))
+                bond.canvas_ids.append(self.canvas.create_line(
+                    x1 + px * offset * inner_sign, y1 + py * offset * inner_sign,
+                    x2 + px * offset * inner_sign, y2 + py * offset * inner_sign,
+                    fill=colour, width=width, capstyle=tk.ROUND))
+            else:
+                bond.canvas_ids.append(self.canvas.create_line(
+                    x1 + px * offset, y1 + py * offset, x2 + px * offset, y2 + py * offset,
+                    fill=colour, width=width, capstyle=tk.ROUND))
+                bond.canvas_ids.append(self.canvas.create_line(
+                    x1 - px * offset, y1 - py * offset, x2 - px * offset, y2 - py * offset,
+                    fill=colour, width=width, capstyle=tk.ROUND))
         elif bond.order == 3:
             offset = 4.2
             bond.canvas_ids.append(self.canvas.create_line(x1, y1, x2, y2,
-                                                           fill=colour, width=width))
+                                                           fill=colour, width=width,
+                                                           capstyle=tk.ROUND))
             bond.canvas_ids.append(self.canvas.create_line(
                 x1 + px * offset, y1 + py * offset, x2 + px * offset, y2 + py * offset,
-                fill=colour, width=width))
+                fill=colour, width=width, capstyle=tk.ROUND))
             bond.canvas_ids.append(self.canvas.create_line(
                 x1 - px * offset, y1 - py * offset, x2 - px * offset, y2 - py * offset,
-                fill=colour, width=width))
+                fill=colour, width=width, capstyle=tk.ROUND))
 
     def _draw_annotation(self, annotation):
         selected = annotation is self.selected_annotation
