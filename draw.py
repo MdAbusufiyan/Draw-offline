@@ -12,6 +12,8 @@ Interaction model (ChemDraw-like)
 - Select tool .......................... click, shift-click, or rubber-band box select.
 - Clean Up ............................. RDKit 2D layout (only when you press the button).
 - Import SMILES / Export .mol .......... through RDKit.
+- Properties panel + Paste info / Copy info: per-structure formula, masses, elemental
+  analysis, SMILES, logP, TPSA, HBD/HBA once that structure is valid.
 
 Install the chemistry backend with:  python -m pip install rdkit
 """
@@ -26,10 +28,10 @@ from collections import defaultdict
 
 try:
     from rdkit import Chem, rdBase
-    from rdkit.Chem import AllChem, Descriptors, rdMolDescriptors
+    from rdkit.Chem import AllChem, Descriptors, rdMolDescriptors, Crippen, Lipinski
     RDKIT_AVAILABLE = True
 except ImportError:
-    Chem = rdBase = AllChem = Descriptors = rdMolDescriptors = None
+    Chem = rdBase = AllChem = Descriptors = rdMolDescriptors = Crippen = Lipinski = None
     RDKIT_AVAILABLE = False
 
 
@@ -237,7 +239,9 @@ class MoleculeEditor:
         tk.Spinbox(third, from_=-3, to=3, width=4, textvariable=self.charge_value).pack(side=tk.LEFT)
         tk.Button(third, text="Apply to selected atom(s)", command=self.apply_charge).pack(
             side=tk.LEFT, padx=5)
-        tk.Label(third, text="Check structure never changes your drawing. Clean up only when you press it.",
+        tk.Button(third, text="Paste info", command=self.paste_info).pack(side=tk.LEFT, padx=(14, 2))
+        tk.Button(third, text="Copy info", command=self.copy_info).pack(side=tk.LEFT, padx=2)
+        tk.Label(third, text="Check never edits your drawing.",
                  fg="#5B6573").pack(side=tk.LEFT, padx=8)
 
         main = tk.Frame(self.root)
@@ -270,10 +274,15 @@ class MoleculeEditor:
                                          wraplength=255, fg="#5B6573", font=("Arial", 9, "bold"))
         self.validation_label.pack(fill=tk.X, pady=(4, 4))
 
-        self.diagnostics_text = tk.Text(panel, height=11, wrap=tk.WORD, relief=tk.FLAT,
+        self.diagnostics_text = tk.Text(panel, height=7, wrap=tk.WORD, relief=tk.FLAT,
                                         bg="#F7F8FA", fg="#24292F", font=("Arial", 9),
                                         padx=6, pady=6, state=tk.DISABLED)
-        self.diagnostics_text.pack(fill=tk.BOTH, expand=True)
+        self.diagnostics_text.pack(fill=tk.X)
+
+        tk.Label(panel, text="PROPERTIES", font=("Arial", 10, "bold")).pack(anchor="w", pady=(8, 2))
+        self.props_text = tk.Text(panel, height=10, wrap=tk.WORD, relief=tk.FLAT, bg="#F7F8FA",
+                                  fg="#24292F", font=("Arial", 9), padx=6, pady=6, state=tk.DISABLED)
+        self.props_text.pack(fill=tk.BOTH, expand=True)
 
         tk.Label(panel,
                  text=("Chemistry engine: RDKit" if RDKIT_AVAILABLE else
@@ -361,21 +370,18 @@ class MoleculeEditor:
         self.invalid_atom_indices.clear()
 
     # -------------------------------------------------------- chemistry engine
-    def _build_sanitized_molecule(self):
+    def _build_molecule(self, atoms, bonds):
         """Separate RDKit molecule. Never rewrites the editor's own graph."""
         if not RDKIT_AVAILABLE:
             return None, "RDKit is not installed"
-        if not self.atoms:
-            return None, "Empty drawing"
-        rw = Chem.RWMol()
-        index = {}
+        rw, index = Chem.RWMol(), {}
         try:
-            for atom in self.atoms:
+            for atom in atoms:
                 rd = Chem.Atom(atom.element)
                 rd.SetFormalCharge(int(atom.charge))
                 index[atom] = rw.AddAtom(rd)
             types = {1: Chem.BondType.SINGLE, 2: Chem.BondType.DOUBLE, 3: Chem.BondType.TRIPLE}
-            for bond in self.bonds:
+            for bond in bonds:
                 rw.AddBond(index[bond.atom1], index[bond.atom2], types[bond.order])
             mol = rw.GetMol()
             with rdBase.BlockLogs():
@@ -383,6 +389,11 @@ class MoleculeEditor:
             return mol, None
         except Exception as exc:
             return None, (str(exc).splitlines() or [exc.__class__.__name__])[0][:240]
+
+    def _build_sanitized_molecule(self):
+        if not self.atoms:
+            return None, "Empty drawing"
+        return self._build_molecule(self.atoms, self.bonds)
 
     def _fallback_targets(self, atom):
         c = atom.charge
@@ -442,8 +453,8 @@ class MoleculeEditor:
                         "around atoms " + ", ".join(str(i + 1) for i in ids[:8]) + ".")
         return "The chemistry engine could not sanitize this graph: " + (raw or "unknown error")
 
-    def has_unusual_bonds(self):
-        for b in self.bonds:
+    def has_unusual_bonds(self, bonds=None):
+        for b in (self.bonds if bonds is None else bonds):
             a, c = b.atom1.element, b.atom2.element
             if "H" in (a, c) and b.order != 1:
                 return True
@@ -636,6 +647,136 @@ class MoleculeEditor:
                 fh.write(Chem.MolToMolBlock(mol))
             self._set_status(f"Exported {path}")
 
+    # ----------------------------------------------- per-structure properties
+    def _fragment_mol(self, comp):
+        members = set(comp)
+        bonds = [b for b in self.bonds if b.atom1 in members]
+        if self.has_unusual_bonds(bonds):
+            return None
+        mol, _err = self._build_molecule(comp, bonds)
+        return mol
+
+    def fragment_info(self, comp, full=False):
+        """Properties of one drawn structure, or None if it is not valid yet."""
+        if not RDKIT_AVAILABLE:
+            return None
+        mol = self._fragment_mol(comp)
+        if mol is None:
+            return None
+        pt = Chem.GetPeriodicTable()
+        mass = defaultdict(float)
+        for at in Chem.AddHs(mol).GetAtoms():
+            mass[at.GetSymbol()] += pt.GetAtomicWeight(at.GetAtomicNum())
+        total = sum(mass.values()) or 1.0
+        order = sorted(mass, key=lambda e: (e != "C", e != "H", e))
+        exact = Descriptors.ExactMolWt(mol)
+        info = {
+            "formula": rdMolDescriptors.CalcMolFormula(mol),
+            "exact": exact,
+            "mw": Descriptors.MolWt(mol),
+            "mh": exact + 1.007276,
+            "elemental": "; ".join(f"{e}, {100 * mass[e] / total:.2f}" for e in order),
+            "smiles": Chem.MolToSmiles(mol),
+            "logp": Crippen.MolLogP(mol),
+            "tpsa": rdMolDescriptors.CalcTPSA(mol),
+            "hbd": Lipinski.NumHDonors(mol),
+            "hba": Lipinski.NumHAcceptors(mol),
+        }
+        if full:
+            try:
+                info["inchi"] = Chem.MolToInchi(mol)
+                info["inchikey"] = Chem.MolToInchiKey(mol)
+            except Exception:
+                info["inchi"] = info["inchikey"] = "unavailable"
+        return info
+
+    def info_text(self, i, full=False):
+        lines = [f"Formula: {i['formula']}",
+                 f"Exact Mass: {i['exact']:.2f}",
+                 f"Mol. Wt.: {i['mw']:.2f}",
+                 f"m/z: {i['exact']:.2f} (100.0%), [M+H]+ {i['mh']:.2f}",
+                 f"Elemental Analysis: {i['elemental']}"]
+        if full:
+            lines += [f"SMILES: {i['smiles']}", f"InChI: {i['inchi']}",
+                      f"InChIKey: {i['inchikey']}", f"logP: {i['logp']:.2f}",
+                      f"TPSA: {i['tpsa']:.1f}", f"HBD/HBA: {i['hbd']}/{i['hba']}"]
+        return "\n".join(lines)
+
+    def _target_fragments(self):
+        comps = self.get_connected_components()
+        if self.selected_atoms:
+            return [c for c in comps if any(a in self.selected_atoms for a in c)]
+        return comps
+
+    def _update_properties(self):
+        if not RDKIT_AVAILABLE:
+            text = "Install RDKit for structure properties."
+        else:
+            frags = self._target_fragments()
+            if not frags:
+                text = "Draw a structure to see its properties."
+            else:
+                parts = []
+                for n, comp in enumerate(frags[:3], 1):
+                    info = self.fragment_info(comp)
+                    head = f"Structure {n}\n" if len(frags) > 1 else ""
+                    if info is None:
+                        parts.append(head + "Not valid yet. Fix the red atom(s) and it will appear here.")
+                    else:
+                        parts.append(head + self.info_text(info) +
+                                     f"\nSMILES: {info['smiles']}\nlogP: {info['logp']:.2f}   "
+                                     f"TPSA: {info['tpsa']:.1f}\nHBD/HBA: {info['hbd']}/{info['hba']}")
+                if len(frags) > 3:
+                    parts.append("Select a structure to see the others.")
+                text = "\n\n".join(parts)
+        self.props_text.config(state=tk.NORMAL)
+        self.props_text.delete("1.0", tk.END)
+        self.props_text.insert(tk.END, text)
+        self.props_text.config(state=tk.DISABLED)
+
+    def paste_info(self):
+        """Place a ChemDraw-style info block under each valid structure."""
+        if not RDKIT_AVAILABLE:
+            messagebox.showinfo("Paste info", "Install RDKit first.", parent=self.root)
+            return
+        items, skipped = [], 0
+        for comp in self._target_fragments():
+            info = self.fragment_info(comp)
+            if info is None:
+                skipped += 1
+            else:
+                items.append((comp, info))
+        if not items:
+            messagebox.showwarning("Paste info", "No valid structure to describe yet.", parent=self.root)
+            return
+        self.save_state()
+        for comp, info in items:
+            xs, ys = [a.x for a in comp], [a.y for a in comp]
+            self.annotations = [an for an in self.annotations if not (
+                an.kind == "info" and min(xs) - 80 <= an.x1 <= max(xs) + 80
+                and max(ys) <= an.y1 <= max(ys) + 200)]
+            self.annotations.append(Annotation("info", (min(xs) + max(xs)) / 2, max(ys) + 34,
+                                               text=self.info_text(info)))
+        self._redraw_canvas(refresh_chemistry=False)
+        self._set_status(f"Pasted info for {len(items)} structure(s)." +
+                         (f" Skipped {skipped} invalid." if skipped else ""))
+
+    def copy_info(self):
+        """Copy formula, masses, SMILES, InChI etc. of valid structures to the clipboard."""
+        if not RDKIT_AVAILABLE:
+            return
+        blocks = []
+        for comp in self._target_fragments():
+            info = self.fragment_info(comp, full=True)
+            if info:
+                blocks.append(self.info_text(info, full=True))
+        if not blocks:
+            self._set_status("No valid structure to copy.")
+            return
+        self.root.clipboard_clear()
+        self.root.clipboard_append("\n\n".join(blocks))
+        self._set_status("Structure info copied to the clipboard.")
+
     # ---------------------------------------------------------------- geometry
     def _canvas_size(self):
         return max(self.canvas.winfo_width(), 400), max(self.canvas.winfo_height(), 300)
@@ -665,6 +806,12 @@ class MoleculeEditor:
 
     def find_annotation_at(self, x, y):
         for an in reversed(self.annotations):
+            if an.kind == "info":
+                lines = an.text.splitlines() or [""]
+                w, h = max(len(l) for l in lines) * 6, len(lines) * 14
+                if abs(x - an.x1) <= w / 2 + 5 and an.y1 - 5 <= y <= an.y1 + h + 5:
+                    return an
+                continue
             if an.kind in ("plus", "equals", "text"):
                 w = max(18, len(an.text or an.kind) * 8)
                 if abs(x - an.x1) <= w / 2 + 5 and abs(y - an.y1) <= 17:
@@ -720,7 +867,9 @@ class MoleculeEditor:
 
         def score(a):
             r = math.radians(a)
-            return self._clearance(atom.x + L * math.cos(r), atom.y + L * math.sin(r), (atom,))
+            px, py = atom.x + L * math.cos(r), atom.y + L * math.sin(r)
+            return -sum(1.0 / max(math.hypot(px - o.x, py - o.y), 1.0) ** 2
+                        for o in self.atoms if o is not atom)
         best = math.radians(max(cands, key=score))
         return math.cos(best), math.sin(best)
 
@@ -1115,7 +1264,7 @@ class MoleculeEditor:
 
         def crowd(s):
             cx, cy = centre(s)
-            return sum(math.hypot(o.x - cx, o.y - cy) < R * 0.9 for o in self.atoms if o not in (a, b))
+            return sum(math.hypot(o.x - cx, o.y - cy) < R * 1.2 for o in self.atoms if o not in (a, b))
 
         side = min((1, -1), key=crowd)
         cx, cy = centre(side)
@@ -1346,6 +1495,9 @@ class MoleculeEditor:
                                     width=width, fill=colour)
             self.canvas.create_line(an.x2, an.y2 + 3, an.x1, an.y1 + 3, arrow=tk.LAST,
                                     width=width, fill=colour)
+        elif an.kind == "info":
+            self.canvas.create_text(an.x1, an.y1, text=an.text, anchor="n", justify=tk.LEFT,
+                                    fill=colour, font=("Arial", 9))
         else:
             content = an.text or ("+" if an.kind == "plus" else "=")
             size = 24 if an.kind in ("plus", "equals") else 12
@@ -1521,6 +1673,7 @@ class MoleculeEditor:
             "invalid": ("⚠ Needs review", "#B42318"),
         }[self.validation_state]
         self.validation_label.config(text=text, fg=colour)
+        self._update_properties()
 
     def _set_diagnostics(self, lines):
         self.diagnostics_text.config(state=tk.NORMAL)
