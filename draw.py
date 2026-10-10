@@ -113,7 +113,8 @@ class MoleculeEditor:
     MIN_ATOM_GAP = 25.0
 
     TOOL_HELP = {
-        "draw": "Draw: click blank for an atom; click an atom then a target to connect. Esc clears the anchor for a separate fragment.",
+        "draw": "Draw: click blank for an atom; click an atom then a target to connect. Clicking a bond with — cycles its order; = or ≡ applies that order.",
+        "atom": "Atom: choose an element, then click empty canvas to place it or an existing atom to change its element. Existing bonds are preserved.",
         "select": "Select: click an atom/bond, or drag a box around atoms. Shift-click or Shift-drag adds to selection.",
         "move": "Move: drag any selected atom to move its whole connected molecule; box-select can move several fragments.",
         "erase": "Erase: click an atom, bond or annotation. Right-click also erases.",
@@ -158,6 +159,16 @@ class MoleculeEditor:
         self.selected_bond = None
         self.selected_annotation = None
         self.pending_bond_atom = None
+
+        # Template placement follows the familiar sketcher pattern: choose a
+        # template, then click the canvas to place it. Clicking an atom fuses a
+        # ring at that vertex; dragging from an atom places a linked ring.
+        self.pending_placement = None
+        self.placement_start = None
+        self.placement_start_atom = None
+        self.placement_start_bond = None
+        self.placement_dragged = False
+        self.placement_preview_ids = []
 
         # Pointer/drag state
         self.last_canvas_pos = (440.0, 330.0)
@@ -206,8 +217,8 @@ class MoleculeEditor:
 
         ttk.Separator(top, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=7)
         tk.Label(top, text="Tool").pack(side=tk.LEFT, padx=(0, 3))
-        for value, label in (("draw", "Draw"), ("select", "Select"),
-                             ("move", "Move"), ("erase", "Erase")):
+        for value, label in (("draw", "Draw"), ("atom", "Atom"),
+                             ("select", "Select"), ("move", "Move"), ("erase", "Erase")):
             tk.Radiobutton(top, text=label, variable=self.tool, value=value,
                            command=self._tool_changed, takefocus=False).pack(side=tk.LEFT, padx=1)
 
@@ -222,16 +233,16 @@ class MoleculeEditor:
         second.pack(side=tk.TOP, fill=tk.X)
 
         tk.Label(second, text="Rings").pack(side=tk.LEFT, padx=(2, 4))
-        tk.Button(second, text="Benzene", command=self.add_benzene).pack(side=tk.LEFT, padx=2)
-        tk.Button(second, text="Cyclohexane", command=self.add_cyclohexane).pack(side=tk.LEFT, padx=2)
-        tk.Button(second, text="Cyclopentane", command=self.add_cyclopentane).pack(side=tk.LEFT, padx=2)
+        tk.Button(second, text="Benzene", command=lambda: self.arm_placement("benzene")).pack(side=tk.LEFT, padx=2)
+        tk.Button(second, text="Cyclohexane", command=lambda: self.arm_placement("cyclohexane")).pack(side=tk.LEFT, padx=2)
+        tk.Button(second, text="Cyclopentane", command=lambda: self.arm_placement("cyclopentane")).pack(side=tk.LEFT, padx=2)
 
         ttk.Separator(second, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=7)
         tk.Label(second, text="Groups").pack(side=tk.LEFT, padx=(0, 4))
         for label, group in (("CH₃", "CH3"), ("OH", "OH"),
                              ("NH₂", "NH2"), ("COOH", "COOH")):
             tk.Button(second, text=label,
-                      command=lambda group_name=group: self.add_functional_group(group_name)).pack(
+                      command=lambda group_name=group: self.arm_placement(group_name)).pack(
                           side=tk.LEFT, padx=2)
 
         ttk.Separator(second, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=7)
@@ -324,7 +335,7 @@ class MoleculeEditor:
                              ("s", "S"), ("p", "P"), ("f", "F")):
             self.root.bind(key, lambda _e, value=element: self._set_element_from_key(value))
         for order in (1, 2, 3):
-            self.root.bind(str(order), lambda _e, value=order: self.bond_order.set(value))
+            self.root.bind(str(order), lambda _e, value=order: self._set_bond_order_from_key(value))
 
     # ------------------------------------------------------ state and history
     def _capture_state(self):
@@ -376,6 +387,12 @@ class MoleculeEditor:
         self.selected_bond = None
         self.selected_annotation = None
         self.pending_bond_atom = None
+        self.pending_placement = None
+        self.placement_start = None
+        self.placement_start_atom = None
+        self.placement_start_bond = None
+        self.placement_dragged = False
+        self._clear_placement_preview()
         self.drag_start_atom = None
         self.annotation_start = None
 
@@ -777,6 +794,287 @@ class MoleculeEditor:
 
     def on_mouse_motion(self, event):
         self.last_canvas_pos = (event.x, event.y)
+        if self.pending_placement and self.placement_start is None:
+            anchor = self.find_atom_at(event.x, event.y)
+            hovered_bond = None if anchor else self.find_bond_at(event.x, event.y)
+            if hovered_bond is not None and self.pending_placement not in (
+                    "benzene", "cyclohexane", "cyclopentane"):
+                anchor = min((hovered_bond.atom1, hovered_bond.atom2),
+                             key=lambda a: a.distance_to(event.x, event.y))
+                hovered_bond = None
+            self._placement_preview_geometry(event.x, event.y, anchor=anchor,
+                                             dragged=False, bond=hovered_bond)
+
+    # ------------------------------------------------------ template placement
+    def arm_placement(self, kind):
+        """Arm a one-shot ring/group tool; the next canvas click places it."""
+        valid = {"benzene", "cyclohexane", "cyclopentane", "CH3", "OH", "NH2", "COOH"}
+        if kind not in valid:
+            return
+        self.pending_placement = kind
+        self.placement_start = None
+        self.placement_start_atom = None
+        self.placement_start_bond = None
+        self.placement_dragged = False
+        self.pending_bond_atom = None
+        self.drag_start_atom = None
+        self._clear_placement_preview()
+        if self.tool.get() != "draw":
+            self.tool.set("draw")
+            self._tool_changed()
+        self._set_status(
+            f"{kind} selected: click empty canvas to place; click an atom to attach a group/ring. "
+            "For rings, click an existing bond to fuse along that bond. Drag from an atom to set the attachment direction. Esc cancels."
+        )
+
+    def _clear_placement_preview(self):
+        for item_id in self.placement_preview_ids:
+            self.canvas.delete(item_id)
+        self.placement_preview_ids = []
+
+    def _preview_line(self, x1, y1, x2, y2, width=2, arrow=None):
+        kwargs = {"fill": "#82A9E6", "width": width, "dash": (3, 3),
+                  "capstyle": tk.ROUND}
+        if arrow is not None:
+            kwargs["arrow"] = arrow
+        self.placement_preview_ids.append(
+            self.canvas.create_line(x1, y1, x2, y2, **kwargs))
+
+    def _placement_direction(self, anchor, x, y):
+        dx, dy = x - anchor.x, y - anchor.y
+        if math.hypot(dx, dy) < 2:
+            _ux, _uy, _pts, _crowded = self._best_attached_direction(
+                anchor, lambda ux, uy: [(anchor.x + self.BOND_LENGTH * ux,
+                                         anchor.y + self.BOND_LENGTH * uy, "C")])
+            return _ux, _uy
+        sx, sy = self.snap_angle(anchor.x, anchor.y, x, y)
+        length = math.hypot(sx - anchor.x, sy - anchor.y)
+        if length < 1e-6:
+            return 1.0, 0.0
+        return (sx - anchor.x) / length, (sy - anchor.y) / length
+
+    def _placement_preview_geometry(self, x, y, anchor=None, dragged=False, bond=None):
+        """Draw a non-mutating preview using the same placement geometry as commit."""
+        kind = self.pending_placement
+        if not kind:
+            return
+        self._clear_placement_preview()
+        ring_sizes = {"benzene": (6, True), "cyclohexane": (6, False),
+                      "cyclopentane": (5, False)}
+        if kind in ring_sizes:
+            size, aromatic = ring_sizes[kind]
+            if bond is not None:
+                ring_points = self._fused_bond_ring_points(bond, size, x, y)
+                pts = [(px, py) for px, py, _ in ring_points]
+                # The shared bond is already in the drawing; the dashed preview
+                # makes the intended fused-ring side visible before placement.
+                for i in range(size):
+                    self._preview_line(*pts[i], *pts[(i + 1) % size])
+            elif anchor is not None:
+                ux, uy = self._placement_direction(anchor, x, y)
+                ring_points = self._ring_points_attached(anchor, ux, uy, size)
+                pts = [(px, py) for px, py, _ in ring_points]
+                self._preview_line(anchor.x, anchor.y, pts[0][0], pts[0][1])
+                for i in range(size):
+                    self._preview_line(*pts[i], *pts[(i + 1) % size])
+            else:
+                ring_points = self._ring_points_unattached(x, y, size)
+                pts = [(px, py) for px, py, _ in ring_points]
+                for i in range(size):
+                    self._preview_line(*pts[i], *pts[(i + 1) % size])
+            if aromatic:
+                cx = sum(px for px, py in pts) / size
+                cy = sum(py for px, py in pts) / size
+                rad = sum(math.hypot(px - cx, py - cy) for px, py in pts) / size * 0.5
+                self.placement_preview_ids.append(self.canvas.create_oval(
+                    cx-rad, cy-rad, cx+rad, cy+rad, outline="#82A9E6",
+                    width=1.5, dash=(3, 3), fill=""))
+            return
+
+        # Functional groups: preview only, never add temporary Atom/Bond objects.
+        if anchor is not None:
+            ux, uy = self._placement_direction(anchor, x, y)
+            points = self._group_geometry_attached(anchor, kind, ux, uy)
+            if kind == "COOH":
+                c = points[0]; o1, o2 = points[1], points[2]
+                self._preview_line(anchor.x, anchor.y, c[0], c[1])
+                self._preview_line(c[0], c[1], o1[0], o1[1], width=2)
+                self._preview_line(c[0], c[1], o2[0], o2[1])
+                # Parallel short stroke on the nominal C=O side.
+                dx, dy = o1[0]-c[0], o1[1]-c[1]
+                length = max(math.hypot(dx, dy), 1)
+                px, py = -dy/length*3, dx/length*3
+                self._preview_line(c[0]+px, c[1]+py, o1[0]+px, o1[1]+py, width=1)
+                labels = [(c[0], c[1], "C"), (o1[0], o1[1], "O"), (o2[0], o2[1], "OH")]
+            else:
+                gx, gy, element = points[0]
+                self._preview_line(anchor.x, anchor.y, gx, gy)
+                label = {"CH3": "CH₃", "OH": "OH", "NH2": "NH₂"}[kind]
+                labels = [(gx, gy, label)]
+        else:
+            points = self._group_geometry_unattached(kind, x, y)
+            labels = []
+            if kind == "CH3":
+                labels = [(points[0][0], points[0][1], "CH₃")]
+            elif kind == "OH":
+                self._preview_line(points[0][0], points[0][1], points[1][0], points[1][1])
+                labels = [(points[0][0], points[0][1], "OH")]
+            elif kind == "NH2":
+                labels = [(points[0][0], points[0][1], "NH₂")]
+            elif kind == "COOH":
+                c, o1, o2 = points
+                self._preview_line(c[0], c[1], o1[0], o1[1])
+                self._preview_line(c[0], c[1], o2[0], o2[1])
+                labels = [(c[0], c[1], "C"), (o1[0], o1[1], "O"), (o2[0], o2[1], "OH")]
+        for lx, ly, label in labels:
+            self.placement_preview_ids.append(self.canvas.create_text(
+                lx, ly, text=label, fill="#497DBF", font=("Arial", 11, "bold")))
+
+    def _fused_bond_ring_points(self, bond, size, hint_x=None, hint_y=None):
+        """Return a regular ring sharing an existing bond, on the less crowded side."""
+        a, b = bond.atom1, bond.atom2
+        dx, dy = b.x - a.x, b.y - a.y
+        length = math.hypot(dx, dy)
+        if length < 1e-6:
+            return self._ring_points_unattached(a.x, a.y, size)
+        radius = length / (2.0 * math.sin(math.pi / size))
+        apothem = radius * math.cos(math.pi / size)
+        nx, ny = -dy / length, dx / length
+        mx, my = (a.x + b.x) / 2.0, (a.y + b.y) / 2.0
+        if hint_x is None or hint_y is None:
+            hint_x, hint_y = mx, my
+        side_distance = ((dx * (hint_y - my) - dy * (hint_x - mx)) / length)
+        preferred_side = 1 if side_distance >= 0 else -1
+        sides = (preferred_side, -preferred_side) if abs(side_distance) > 3 else (1, -1)
+        scored = []
+        for side in sides:
+            cx, cy = mx + side * apothem * nx, my + side * apothem * ny
+            start_angle = math.atan2(a.y - cy, a.x - cx)
+            angle_b = math.atan2(b.y - cy, b.x - cx)
+            delta = (angle_b - start_angle + math.pi) % (2 * math.pi) - math.pi
+            coords = [(cx + radius * math.cos(start_angle + i * delta),
+                       cy + radius * math.sin(start_angle + i * delta), "C")
+                      for i in range(size)]
+            coords[0] = (a.x, a.y, a.element)
+            coords[1] = (b.x, b.y, b.element)
+            score = self._geometry_score(coords[2:], excluded={a, b},
+                                         angle_difference=0 if side == preferred_side else 1)
+            scored.append((score, coords))
+        return min(scored, key=lambda item: item[0])[1]
+
+    def _add_ring_fused_to_bond(self, bond, size, aromatic=False, hint_x=None, hint_y=None):
+        """Add a ring that shares the selected bond; do not alter that bond."""
+        if bond not in self.bonds:
+            return
+        points = self._fused_bond_ring_points(bond, size, hint_x, hint_y)
+        self.save_state()
+        cycle = [bond.atom1, bond.atom2]
+        for px, py, element in points[2:]:
+            atom = Atom(px, py, element)
+            self.atoms.append(atom)
+            cycle.append(atom)
+        # The existing shared bond is deliberately preserved. For a fused
+        # benzene template, choose the two bonds at the fusion endpoints to fit
+        # their current valence; the new internal bonds then alternate. This is
+        # template construction, not mutation of any pre-existing bond.
+        endpoint_orders = (1, 1)
+        if aromatic and size == 6:
+            def endpoint_bond_order(atom):
+                total = atom.bond_order_sum()
+                other_bonds = [b for b in atom.bonds if b is not bond]
+                desired = (3 - total) if not other_bonds else (4 - total)
+                return max(1, min(3, int(desired)))
+            endpoint_orders = (endpoint_bond_order(bond.atom1),
+                               endpoint_bond_order(bond.atom2))
+        for i in range(1, size):
+            if aromatic and size == 6:
+                if i == 1:
+                    order = endpoint_orders[1]  # bond from shared atom B to new atom
+                elif i == 5:
+                    order = endpoint_orders[0]  # bond from new atom to shared atom A
+                elif i % 2 == 0:
+                    order = 3 - endpoint_orders[1]
+                else:
+                    order = endpoint_orders[1]
+            else:
+                order = 1
+            self.bonds.append(Bond(cycle[i], cycle[(i + 1) % size], order))
+        self.selected_atoms = set(cycle[2:])
+        self.selected_bond = None
+        self.selected_annotation = None
+        self.pending_bond_atom = cycle[0]
+        self._invalidate_validation()
+        self._redraw_canvas()
+        self._set_status("Ring fused along the selected bond. The original bond order was preserved; run Check structure to review it.")
+
+    def _finish_placement(self, x, y):
+        kind = self.pending_placement
+        anchor = self.placement_start_atom
+        target_bond = self.placement_start_bond
+        dragged = self.placement_dragged
+        start = self.placement_start or (x, y)
+        self._clear_placement_preview()
+        self.pending_placement = None
+        self.placement_start = None
+        self.placement_start_atom = None
+        self.placement_start_bond = None
+        self.placement_dragged = False
+        self.last_canvas_pos = (x, y)
+
+        ring_sizes = {"benzene": (6, True), "cyclohexane": (6, False),
+                      "cyclopentane": (5, False)}
+        if kind in ring_sizes:
+            size, aromatic = ring_sizes[kind]
+            if target_bond is not None:
+                self._add_ring_fused_to_bond(target_bond, size, aromatic, x, y)
+            elif anchor is not None:
+                # Clicking an atom attaches a distinct ring; dragging from it
+                # controls the direction. Click a bond to create a fused ring.
+                self.selected_atoms = {anchor}
+                self.pending_bond_atom = anchor
+                self._new_ring(size, aromatic)
+            else:
+                self.selected_atoms.clear()
+                self.pending_bond_atom = None
+                self.last_canvas_pos = (start[0], start[1])
+                self._new_ring(size, aromatic)
+            return
+
+        # If a group is clicked on a bond rather than an atom, attach it to the
+        # closer endpoint. Otherwise place it exactly where the user clicked.
+        if anchor is not None:
+            self.selected_atoms = {anchor}
+            self.pending_bond_atom = anchor
+        else:
+            self.selected_atoms.clear()
+            self.pending_bond_atom = None
+            self.last_canvas_pos = (start[0], start[1])
+        self.add_functional_group(kind)
+
+    def _add_fused_ring(self, anchor, size, aromatic=False):
+        """Add a ring sharing its attachment atom, as common template tools do."""
+        def geometry(ux, uy):
+            return self._fused_ring_points(anchor, ux, uy, size)[1:]
+        ux, uy, _points, crowded = self._best_attached_direction(anchor, geometry)
+        points = self._fused_ring_points(anchor, ux, uy, size)
+        self.save_state()
+        cycle = [anchor]
+        for px, py, element in points[1:]:
+            atom = Atom(px, py, element)
+            self.atoms.append(atom)
+            cycle.append(atom)
+        for i in range(size):
+            order = 2 if aromatic and i % 2 == 0 else 1
+            self.bonds.append(Bond(cycle[i], cycle[(i + 1) % size], order))
+        self.selected_atoms = {anchor}
+        self.selected_bond = None
+        self.selected_annotation = None
+        self.pending_bond_atom = anchor
+        self._invalidate_validation()
+        self._redraw_canvas()
+        self._set_status("Ring fused at the selected atom. Existing bonds were preserved; run Check structure to review valence.")
+        if crowded:
+            self._set_status("Ring fused, but nearby atoms may overlap. Move fragments if needed; no atoms were auto-moved.")
 
     # ------------------------------------------------------------ draw events
     def _bond_order_changed(self):
@@ -815,13 +1113,22 @@ class MoleculeEditor:
         if self.tool.get() != "draw":
             self.pending_bond_atom = None
             self.drag_start_atom = None
+            # A pending template is a one-shot drawing tool. Switching tools
+            # cancels it, rather than letting a later click unexpectedly place it.
+            if self.pending_placement is not None:
+                self.pending_placement = None
+                self.placement_start = None
+                self.placement_start_atom = None
+                self.placement_start_bond = None
+                self.placement_dragged = False
+                self._clear_placement_preview()
         if self.tool.get() != "select" and self.selection_start is not None:
             self.selection_start = None
             self.selection_base_atoms.clear()
             self._clear_temp_preview()
         cursor = "crosshair"
-        if self.tool.get() == "select":
-            cursor = "arrow"
+        if self.tool.get() in ("select", "atom"):
+            cursor = "arrow" if self.tool.get() == "select" else "crosshair"
         elif self.tool.get() == "move":
             cursor = "fleur"
         elif self.tool.get() == "erase":
@@ -837,6 +1144,10 @@ class MoleculeEditor:
         except tk.TclError:
             self.selected_element.set(element)
 
+    def _set_bond_order_from_key(self, order):
+        self.bond_order.set(int(order))
+        self._bond_order_changed()
+
     def _update_tool_status(self):
         self._set_status(self.TOOL_HELP.get(self.tool.get(), ""))
 
@@ -848,6 +1159,22 @@ class MoleculeEditor:
         self.canvas.focus_set()
         self.last_canvas_pos = (event.x, event.y)
         mode = self.tool.get()
+
+        if self.pending_placement:
+            self.placement_start = (event.x, event.y)
+            self.placement_start_atom = self.find_atom_at(event.x, event.y)
+            self.placement_start_bond = None if self.placement_start_atom else self.find_bond_at(event.x, event.y)
+            if (self.placement_start_bond is not None and self.pending_placement not in
+                    ("benzene", "cyclohexane", "cyclopentane")):
+                bond = self.placement_start_bond
+                self.placement_start_atom = min(
+                    (bond.atom1, bond.atom2), key=lambda a: a.distance_to(event.x, event.y))
+                self.placement_start_bond = None
+            self.placement_dragged = False
+            self._placement_preview_geometry(
+                event.x, event.y, anchor=self.placement_start_atom, dragged=False,
+                bond=self.placement_start_bond)
+            return
 
         # Reaction annotations live on their own layer and never become atoms/bonds.
         if mode in ("arrow", "equilibrium"):
@@ -881,6 +1208,72 @@ class MoleculeEditor:
         atom = self.find_atom_at(event.x, event.y)
         bond = None if atom else self.find_bond_at(event.x, event.y)
         annotation = None if atom or bond else self.find_annotation_at(event.x, event.y)
+
+        if mode == "atom":
+            self.pending_bond_atom = None
+            self.drag_start_atom = None
+            self.selected_bond = None
+            self.selected_annotation = None
+            if atom is not None:
+                self.selected_atoms = {atom}
+                chosen = self.selected_element.get()
+                if atom.element != chosen:
+                    self.save_state()
+                    old_element = atom.element
+                    atom.element = chosen
+                    self._invalidate_validation()
+                    self._redraw_canvas()
+                    self._set_status(
+                        f"Changed atom {old_element} to {chosen}. Its existing bonds and formal charge were preserved; check valence when ready."
+                    )
+                else:
+                    self._redraw_canvas(refresh_chemistry=False)
+                    self._set_status(f"Selected {chosen}; it already has that element.")
+            elif bond is None and annotation is None:
+                self.save_state()
+                new_atom = Atom(event.x, event.y, self.selected_element.get())
+                self.atoms.append(new_atom)
+                self.selected_atoms = {new_atom}
+                self._invalidate_validation()
+                self._redraw_canvas()
+                self._set_status(f"Placed {new_atom.element}. Click an existing atom to change its element; bonds are not auto-corrected.")
+            else:
+                self._set_status("Atom tool changes atoms or places a new atom; use Select to choose a bond.")
+            return
+
+        if mode == "draw" and bond is not None:
+            # Standard sketcher behavior: the active bond order can be applied
+            # directly to an existing bond by clicking it.
+            self.pending_bond_atom = None
+            self.drag_start_atom = None
+            self.selected_atoms.clear()
+            self.selected_annotation = None
+            self.selected_bond = bond
+            current_order = bond.order
+            active_order = int(self.bond_order.get())
+            # Established sketcher convention: the single-bond tool cycles an
+            # existing bond 1 -> 2 -> 3 -> 1. Keep the toolbar on the single
+            # tool so repeated clicks continue cycling. Double/triple tools set
+            # that exact order instead.
+            requested_order = (
+                1 if current_order == 3 else current_order + 1
+            ) if active_order == 1 else active_order
+            if current_order != requested_order:
+                self.save_state()
+                bond.order = requested_order
+                self._invalidate_validation()
+                self._redraw_canvas()
+                labels = {1: "single", 2: "double", 3: "triple"}
+                self._set_status(
+                    f"Bond changed from {labels[current_order]} to "
+                    f"{labels[requested_order]}. Run Check structure to review it."
+                )
+            else:
+                self._redraw_canvas(refresh_chemistry=False)
+                self._set_status(
+                    f"Bond selected (order {bond.order}). Choose — to cycle, or = / ≡ to set an exact order."
+                )
+            return
 
         if mode == "draw":
             if atom is not None:
@@ -968,6 +1361,15 @@ class MoleculeEditor:
 
     def on_drag(self, event):
         self.last_canvas_pos = (event.x, event.y)
+        if self.pending_placement and self.placement_start is not None:
+            sx, sy = self.placement_start
+            if math.hypot(event.x - sx, event.y - sy) >= max(12.0, self.BOND_LENGTH * 0.35):
+                self.placement_dragged = True
+            anchor = self.placement_start_atom
+            self._placement_preview_geometry(event.x, event.y, anchor=anchor,
+                                             dragged=self.placement_dragged,
+                                             bond=self.placement_start_bond)
+            return
         if self.annotation_start is not None and self.tool.get() in ("arrow", "equilibrium"):
             self._draw_annotation_preview(event.x, event.y)
             return
@@ -1012,6 +1414,9 @@ class MoleculeEditor:
 
     def on_release(self, event):
         self.last_canvas_pos = (event.x, event.y)
+        if self.pending_placement and self.placement_start is not None:
+            self._finish_placement(event.x, event.y)
+            return
         if self.annotation_start is not None and self.tool.get() in ("arrow", "equilibrium"):
             x1, y1 = self.annotation_start
             self._clear_temp_preview()
@@ -1143,6 +1548,12 @@ class MoleculeEditor:
 
     def cancel_pending(self):
         self.pending_bond_atom = None
+        self.pending_placement = None
+        self.placement_start = None
+        self.placement_start_atom = None
+        self.placement_start_bond = None
+        self.placement_dragged = False
+        self._clear_placement_preview()
         self.drag_start_atom = None
         self.annotation_start = None
         self.move_component = []
@@ -1702,7 +2113,15 @@ class MoleculeEditor:
         return False
 
     def clear_all(self):
+        if self.pending_placement is not None:
+            self.pending_placement = None
+            self.placement_start = None
+            self.placement_start_atom = None
+            self.placement_start_bond = None
+            self.placement_dragged = False
+            self._clear_placement_preview()
         if not self.atoms and not self.annotations:
+            self._set_status("Cleared pending placement.")
             return
         if not messagebox.askyesno("Clear drawing", "Clear all atoms, bonds and reaction annotations?",
                                    parent=self.root):
