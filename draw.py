@@ -35,16 +35,28 @@ except ImportError:
     RDKIT_AVAILABLE = False
 
 
-ELEMENTS = ["C", "N", "O", "S", "P", "F", "Cl", "Br", "I", "H"]
+ELEMENTS = ["C", "N", "O", "S", "P", "F", "Cl", "Br", "I", "H",
+            "B", "Si", "Se", "As", "Li", "Na", "K", "Mg", "Ca", "Zn",
+            "Al", "Fe", "Cu", "Mn", "Co", "Pt", "Au", "Ag", "Gd", "Sn", "Bi", "Hg"]
 ATOMIC_WEIGHTS = {
     "H": 1.008, "C": 12.011, "N": 14.007, "O": 15.999,
     "F": 18.998, "P": 30.974, "S": 32.06, "Cl": 35.45,
     "Br": 79.904, "I": 126.904,
+    "B": 10.81, "Si": 28.085, "Se": 78.971, "As": 74.922,
+    "Li": 6.94, "Na": 22.990, "K": 39.098, "Mg": 24.305, "Ca": 40.078,
+    "Zn": 65.38, "Al": 26.982, "Fe": 55.845, "Cu": 63.546,
+    "Mn": 54.938, "Co": 58.933, "Pt": 195.084, "Au": 196.967,
+    "Ag": 107.868, "Gd": 157.25, "Sn": 118.710, "Bi": 208.980, "Hg": 200.592,
 }
 COMMON_VALENCES = {
     "C": (4,), "N": (3, 5), "O": (2,), "S": (2, 4, 6),
     "P": (3, 5), "F": (1,), "Cl": (1, 3, 5, 7),
     "Br": (1, 3, 5, 7), "I": (1, 3, 5, 7), "H": (1,),
+    "B": (3,), "Si": (4,), "Se": (2, 4, 6), "As": (3, 5),
+    "Li": (1,), "Na": (1,), "K": (1,), "Mg": (2,), "Ca": (2,),
+    "Zn": (2,), "Al": (3,), "Fe": (2, 3), "Cu": (1, 2),
+    "Mn": (2, 3, 4, 7), "Co": (2, 3), "Pt": (2, 4), "Au": (1, 3),
+    "Ag": (1,), "Gd": (3,), "Sn": (2, 4), "Bi": (3, 5), "Hg": (1, 2),
 }
 HALOGENS = {"F", "Cl", "Br", "I"}
 SUBSCRIPTS = str.maketrans("0123456789", "₀₁₂₃₄₅₆₇₈₉")
@@ -113,7 +125,7 @@ class MoleculeEditor:
                 "click bond = cycle order. Hover atom + letter changes element.",
         "select": "Select: click, shift-click, or drag a box. Ring buttons fuse onto a selected bond.",
         "move": "Move: drag a molecule fragment or a reaction annotation.",
-        "erase": "Erase: click an atom, bond or annotation. Right-click also erases.",
+        "erase": "Erase: click an atom to remove it. Click a double/triple bond to remove one line per click; a single bond is removed entirely. Right-click deletes the whole object.",
         "arrow": "Reaction arrow: drag from the tail to the arrowhead.",
         "equilibrium": "Equilibrium arrow: drag from left to right.",
         "plus": "Plus sign: click the canvas to place +.",
@@ -147,6 +159,9 @@ class MoleculeEditor:
 
         self.last_canvas_pos = (440.0, 330.0)
         self.temp_ids = []
+        # Ring/group templates are armed from the toolbar and placed only after
+        # the user clicks the intended canvas location.
+        self.pending_placement = None
 
         # draw-tool state
         self.draw_start = None
@@ -218,13 +233,13 @@ class MoleculeEditor:
                                   ("Cyclopentane", 5, False), ("Cyclopropane", 3, False),
                                   ("Cyclobutane", 4, False), ("Cycloheptane", 7, False)):
             tk.Button(second, text=label,
-                      command=lambda s=size, a=arom: self.add_ring(s, a)).pack(side=tk.LEFT, padx=2)
+                      command=lambda s=size, a=arom: self.request_ring(s, a)).pack(side=tk.LEFT, padx=2)
 
         ttk.Separator(second, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=7)
         tk.Label(second, text="Groups").pack(side=tk.LEFT, padx=(0, 4))
         for label, group in (("CH₃", "CH3"), ("OH", "OH"), ("NH₂", "NH2"), ("COOH", "COOH")):
             tk.Button(second, text=label,
-                      command=lambda g=group: self.add_functional_group(g)).pack(side=tk.LEFT, padx=2)
+                      command=lambda g=group: self.request_functional_group(g)).pack(side=tk.LEFT, padx=2)
 
         ttk.Separator(second, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=7)
         tk.Label(second, text="Reaction").pack(side=tk.LEFT, padx=(0, 3))
@@ -952,6 +967,38 @@ class MoleculeEditor:
         bond = None if atom else self.find_bond_at(event.x, event.y)
         annotation = None if (atom or bond) else self.find_annotation_at(event.x, event.y)
 
+        # Templates are placed on the next canvas click, never immediately when
+        # their toolbar button is pressed. Clicking an atom attaches; clicking a
+        # bond fuses a ring; clicking empty canvas places a free-standing item.
+        if self.pending_placement is not None:
+            pending = self.pending_placement
+            self.pending_placement = None
+            if pending[0] == "ring":
+                self.add_ring(pending[1], pending[2], placement=(event.x, event.y),
+                              anchor_override=atom, fuse_bond=bond, explicit_placement=True)
+            else:
+                self.add_functional_group(pending[1], placement=(event.x, event.y),
+                                          anchor_override=atom, explicit_placement=True)
+            return
+
+        if mode == "atom":
+            if atom is not None:
+                if atom.element != self.selected_element.get():
+                    self.save_state()
+                    atom.element = self.selected_element.get()
+                    self._invalidate_validation()
+                    self._redraw_canvas()
+                    self._set_status(f"Atom changed to {atom.element}.")
+            elif bond is None:
+                self.save_state()
+                placed = self._new_atom(event.x, event.y, self.selected_element.get())
+                self.selected_atoms = {placed}
+                self.selected_bond = self.selected_annotation = None
+                self._invalidate_validation()
+                self._redraw_canvas()
+                self._set_status(f"Placed {placed.element} atom. Click elsewhere to place another.")
+            return
+
         if mode == "draw":
             self.draw_start = (event.x, event.y)
             self.draw_atom, self.draw_bond, self.draw_moved = atom, bond, False
@@ -985,7 +1032,16 @@ class MoleculeEditor:
         elif mode == "erase":
             if atom or bond or annotation:
                 self.save_state()
-                self._delete_object(atom=atom, bond=bond, annotation=annotation)
+                if bond is not None and atom is None and bond.order > 1:
+                    old_order = bond.order
+                    bond.order -= 1
+                    self._set_status(
+                        f"Erased one line from the {old_order}-line bond; it is now order {bond.order}. "
+                        "Click again to remove another line."
+                    )
+                else:
+                    self._delete_object(atom=atom, bond=bond, annotation=annotation)
+                    self._set_status("Erased selected atom, single bond, or reaction annotation.")
                 self._invalidate_validation()
                 self._redraw_canvas()
 
@@ -1165,6 +1221,7 @@ class MoleculeEditor:
             self._redraw_canvas()
 
     def cancel_pending(self):
+        self.pending_placement = None
         self.draw_start = self.draw_atom = self.draw_bond = None
         self.annotation_start = None
         self.rubber_start = None
@@ -1201,25 +1258,46 @@ class MoleculeEditor:
                     return px, py
         return x, y
 
-    def add_ring(self, size, aromatic=False):
-        bond = self.selected_bond if self.selected_bond in self.bonds else None
+    def request_ring(self, size, aromatic=False):
+        self.pending_placement = ("ring", int(size), bool(aromatic))
+        self.tool.set("draw")
+        self._tool_changed()
+        self._set_status(f"Choose where to place the {size}-membered ring: click empty canvas, an atom to attach, or a bond to fuse.")
+
+    def request_functional_group(self, group_type):
+        self.pending_placement = ("group", str(group_type))
+        self.tool.set("draw")
+        self._tool_changed()
+        self._set_status(f"Choose where to place {group_type}: click empty canvas to place, or an atom to attach.")
+
+    def add_ring(self, size, aromatic=False, placement=None, anchor_override=None,
+                 fuse_bond=None, explicit_placement=False):
+        bond = fuse_bond if fuse_bond in self.bonds else None
+        if bond is None and not explicit_placement:
+            bond = self.selected_bond if self.selected_bond in self.bonds else None
         if bond is not None:
             self._fuse_ring(bond, size, aromatic)
             return
         L = self.BOND_LENGTH
         R = L / (2 * math.sin(math.pi / size))
-        anchor = self._anchor_atom()
+        anchor = anchor_override if explicit_placement else self._anchor_atom()
         if anchor is not None:
             ux, uy = self._auto_direction(anchor)
             cx = anchor.x + (L + R) * ux
             cy = anchor.y + (L + R) * uy
             start = math.atan2(uy, ux) + math.pi
         else:
-            x, y = self.last_canvas_pos
-            w, h = self._canvas_size()
-            if x < 5 or y < 5:
-                x, y = w / 2, h / 2
-            cx, cy = self._free_origin(x, y, R + 15)
+            if placement is not None:
+                x, y = placement
+            else:
+                x, y = self.last_canvas_pos
+                w, h = self._canvas_size()
+                if x < 5 or y < 5:
+                    x, y = w / 2, h / 2
+            # Keep the ring centred on the requested point. Only move it if the
+            # centre is already crowded enough to make placement unusable.
+            cx, cy = (self._free_origin(x, y, R + 15)
+                      if self._clearance(x, y) < R * 0.55 else (x, y))
             start = -math.pi / 2
 
         self.save_state()
@@ -1306,18 +1384,23 @@ class MoleculeEditor:
 
     GROUPS = {"CH3": [("C", 0)], "OH": [("O", 0)], "NH2": [("N", 0)]}
 
-    def add_functional_group(self, group_type):
+    def add_functional_group(self, group_type, placement=None, anchor_override=None,
+                            explicit_placement=False):
         L = self.BOND_LENGTH
-        anchor = self._anchor_atom()
+        anchor = anchor_override if explicit_placement else self._anchor_atom()
         if anchor is not None:
             ux, uy = self._auto_direction(anchor)
             gx, gy = anchor.x + L * ux, anchor.y + L * uy
         else:
-            x, y = self.last_canvas_pos
-            w, h = self._canvas_size()
-            if x < 5 or y < 5:
-                x, y = w / 2, h / 2
-            gx, gy = self._free_origin(x, y, L)
+            if placement is not None:
+                x, y = placement
+            else:
+                x, y = self.last_canvas_pos
+                w, h = self._canvas_size()
+                if x < 5 or y < 5:
+                    x, y = w / 2, h / 2
+            gx, gy = (self._free_origin(x, y, L) if self._clearance(x, y) < L * 0.55
+                      else (x, y))
             ux, uy = 1.0, 0.0
         ang = math.atan2(uy, ux)
 
