@@ -2,7 +2,7 @@ import tkinter as tk
 from tkinter import ttk, messagebox
 import math
 import copy
-from collections import defaultdict
+from collections import defaultdict, deque
 
 # Atomic weights for molecular formula calculation
 ATOMIC_WEIGHTS = {
@@ -17,6 +17,27 @@ VALENCES = {
     'F': 1, 'Cl': 1, 'Br': 1, 'I': 1, 'H': 1
 }
 
+# Common valence states for validation
+COMMON_VALENCES = {
+    'C': [4],
+    'N': [3, 5],  # NH3 or NO3-
+    'O': [2],
+    'S': [2, 4, 6],  # H2S, SO2, SO3
+    'P': [3, 5],
+    'F': [1],
+    'Cl': [1, 3, 5, 7],
+    'Br': [1, 3, 5, 7],
+    'I': [1, 3, 5, 7],
+    'H': [1]
+}
+
+# Electronegativity for bond polarity
+ELECTRONEGATIVITY = {
+    'H': 2.20, 'C': 2.55, 'N': 3.04, 'O': 3.44,
+    'F': 3.98, 'P': 2.19, 'S': 2.58, 'Cl': 3.16,
+    'Br': 2.96, 'I': 2.66
+}
+
 class Atom:
     def __init__(self, x, y, element='C'):
         self.x = x
@@ -27,6 +48,8 @@ class Atom:
         self.text_id = None
         self.charge = 0  # For charge indicators
         self.implicit_h = 0  # Number of implicit hydrogens
+        self.is_valid = True  # Valence validation flag
+        self.smiles_index = -1  # For SMILES generation
     
     def distance_to(self, x, y):
         return math.sqrt((self.x - x)**2 + (self.y - y)**2)
@@ -44,6 +67,22 @@ class Atom:
         valence = VALENCES[self.element]
         bond_sum = self.get_bond_order_sum()
         self.implicit_h = max(0, valence - bond_sum - abs(self.charge))
+    
+    def validate_valence(self):
+        """Check if atom has valid valence"""
+        if self.element not in COMMON_VALENCES:
+            self.is_valid = True
+            return True
+        
+        total_bonds = self.get_bond_order_sum() + self.implicit_h
+        
+        # Check against common valence states
+        self.is_valid = total_bonds in COMMON_VALENCES[self.element]
+        return self.is_valid
+    
+    def get_total_valence(self):
+        """Get total valence (bonds + implicit H)"""
+        return self.get_bond_order_sum() + self.implicit_h
 
 class Bond:
     def __init__(self, atom1, atom2, order=1):
@@ -51,6 +90,7 @@ class Bond:
         self.atom2 = atom2
         self.order = order
         self.canvas_ids = []
+        self.is_aromatic = False  # For aromatic bond detection
         
         # Add bond reference to both atoms
         atom1.bonds.append(self)
@@ -153,6 +193,14 @@ class MoleculeEditor:
         
         self.weight_label = tk.Label(info_panel, text="MW: -", font=('Arial', 10))
         self.weight_label.pack(pady=5)
+        
+        self.smiles_label = tk.Label(info_panel, text="SMILES: -", font=('Arial', 9), 
+                                     wraplength=180, justify=tk.LEFT)
+        self.smiles_label.pack(pady=5)
+        
+        self.validation_label = tk.Label(info_panel, text="✓ Valid", 
+                                         font=('Arial', 10, 'bold'), fg='green')
+        self.validation_label.pack(pady=5)
         
         self.atom_count_label = tk.Label(info_panel, text="Atoms: 0", font=('Arial', 10))
         self.atom_count_label.pack(pady=5)
@@ -275,6 +323,7 @@ C,N,O,H: Elements
         # Update implicit H for all atoms
         for atom in self.atoms:
             atom.calculate_implicit_h()
+            atom.validate_valence()
         
         # Draw bonds first (so they appear behind atoms)
         for bond in self.bonds:
@@ -501,8 +550,12 @@ C,N,O,H: Elements
     
     def draw_atom(self, atom):
         """Draw an atom on the canvas"""
-        # Update implicit H count
+        # Update implicit H count and validation
         atom.calculate_implicit_h()
+        atom.validate_valence()
+        
+        # Color based on validation
+        text_color = 'black' if atom.is_valid else 'red'
         
         # Only show label if not carbon or if carbon with no bonds or has charge
         show_label = atom.element != 'C' or len(atom.bonds) == 0 or atom.charge != 0
@@ -523,14 +576,15 @@ C,N,O,H: Elements
             
             atom.text_id = self.canvas.create_text(
                 atom.x, atom.y, text=label,
-                font=('Arial', 12, 'bold'), fill='black'
+                font=('Arial', 12, 'bold'), fill=text_color
             )
         else:
-            # Draw small dot for carbon
+            # Draw small dot for carbon (red if invalid)
             r = 2
+            color = 'black' if atom.is_valid else 'red'
             atom.canvas_id = self.canvas.create_oval(
                 atom.x - r, atom.y - r, atom.x + r, atom.y + r,
-                fill='black', outline='black'
+                fill=color, outline=color
             )
     
     def redraw_atom(self, atom):
@@ -767,11 +821,306 @@ C,N,O,H: Elements
         """Update the info panel with current molecule stats"""
         formula = self.calculate_molecular_formula()
         weight = self.calculate_molecular_weight()
+        smiles = self.generate_smiles()
+        is_valid, issues = self.validate_structure()
         
         self.formula_label.config(text=f"Formula: {formula}")
         self.weight_label.config(text=f"MW: {weight} g/mol")
+        self.smiles_label.config(text=f"SMILES: {smiles}")
+        
+        if is_valid:
+            self.validation_label.config(text="✓ Valid Structure", fg='green')
+        else:
+            self.validation_label.config(text=f"✗ Invalid: {issues}", fg='red')
+        
         self.atom_count_label.config(text=f"Atoms: {len(self.atoms)}")
         self.bond_count_label.config(text=f"Bonds: {len(self.bonds)}")
+    
+    # ===== ADVANCED CHEMISTRY METHODS =====
+    
+    def validate_structure(self):
+        """Comprehensive structure validation"""
+        if not self.atoms:
+            return True, ""
+        
+        issues = []
+        
+        # Check each atom's valence
+        invalid_atoms = []
+        for atom in self.atoms:
+            if not atom.is_valid:
+                invalid_atoms.append(atom.element)
+        
+        if invalid_atoms:
+            issues.append(f"Invalid valence on {len(invalid_atoms)} atom(s)")
+        
+        # Check for disconnected fragments
+        if len(self.atoms) > 1:
+            visited = set()
+            self._dfs_visit(self.atoms[0], visited)
+            if len(visited) < len(self.atoms):
+                issues.append("Disconnected fragments")
+        
+        # Check for odd number of electrons (radicals)
+        total_electrons = 0
+        for atom in self.atoms:
+            if atom.element in VALENCES:
+                total_electrons += VALENCES[atom.element]
+                total_electrons += atom.implicit_h  # Each H adds 1 electron
+        
+        # Subtract bonding electrons
+        for bond in self.bonds:
+            total_electrons -= bond.order * 2
+        
+        # Check common chemistry rules
+        if self.has_invalid_bonds():
+            issues.append("Unusual bond detected")
+        
+        return len(issues) == 0, "; ".join(issues) if issues else ""
+    
+    def _dfs_visit(self, atom, visited):
+        """Depth-first search to check connectivity"""
+        visited.add(atom)
+        for bond in atom.bonds:
+            neighbor = bond.atom2 if bond.atom1 == atom else bond.atom1
+            if neighbor not in visited:
+                self._dfs_visit(neighbor, visited)
+    
+    def has_invalid_bonds(self):
+        """Check for chemically unusual bonds"""
+        for bond in self.bonds:
+            elem1 = bond.atom1.element
+            elem2 = bond.atom2.element
+            
+            # H can't have double/triple bonds
+            if 'H' in [elem1, elem2] and bond.order > 1:
+                return True
+            
+            # Halogens rarely form multiple bonds
+            halogens = {'F', 'Cl', 'Br', 'I'}
+            if elem1 in halogens and elem2 in halogens and bond.order > 1:
+                return True
+        
+        return False
+    
+    def generate_smiles(self):
+        """Generate SMILES string for the molecule"""
+        if not self.atoms:
+            return "-"
+        
+        try:
+            # Reset SMILES indices
+            for atom in self.atoms:
+                atom.smiles_index = -1
+            
+            # Handle disconnected fragments
+            fragments = self.get_connected_components()
+            if len(fragments) > 1:
+                smiles_parts = []
+                for fragment in fragments:
+                    smiles_parts.append(self._generate_smiles_fragment(fragment))
+                return ".".join(smiles_parts)
+            else:
+                return self._generate_smiles_fragment(self.atoms)
+        
+        except Exception as e:
+            return f"Error: {str(e)[:20]}"
+    
+    def get_connected_components(self):
+        """Get all disconnected fragments"""
+        visited = set()
+        components = []
+        
+        for atom in self.atoms:
+            if atom not in visited:
+                component = []
+                self._collect_component(atom, visited, component)
+                components.append(component)
+        
+        return components
+    
+    def _collect_component(self, atom, visited, component):
+        """Collect all atoms in a connected component"""
+        visited.add(atom)
+        component.append(atom)
+        
+        for bond in atom.bonds:
+            neighbor = bond.atom2 if bond.atom1 == atom else bond.atom1
+            if neighbor not in visited:
+                self._collect_component(neighbor, visited, component)
+    
+    def _generate_smiles_fragment(self, atoms):
+        """Generate SMILES for a connected fragment"""
+        if not atoms:
+            return ""
+        
+        # Start from a terminal atom or first atom
+        start_atom = self._find_smiles_start(atoms)
+        
+        # Build SMILES using DFS
+        visited = set()
+        ring_closures = {}
+        ring_counter = [1]  # Use list to allow modification in nested function
+        
+        smiles = self._smiles_dfs(start_atom, None, visited, ring_closures, ring_counter)
+        return smiles
+    
+    def _find_smiles_start(self, atoms):
+        """Find best starting atom for SMILES (prefer terminal atoms)"""
+        # Prefer atoms with fewest bonds
+        return min(atoms, key=lambda a: len(a.bonds))
+    
+    def _smiles_dfs(self, atom, from_bond, visited, ring_closures, ring_counter):
+        """DFS traversal to build SMILES string"""
+        if atom in visited:
+            # Ring closure
+            if atom not in ring_closures:
+                ring_closures[atom] = ring_counter[0]
+                ring_counter[0] += 1
+            return str(ring_closures[atom])
+        
+        visited.add(atom)
+        
+        # Build atom symbol
+        smiles = self._get_smiles_atom(atom)
+        
+        # Add ring closure if needed
+        if atom in ring_closures:
+            smiles += str(ring_closures[atom])
+            del ring_closures[atom]
+        
+        # Sort bonds for canonical SMILES (put main chain first)
+        bonds = sorted([b for b in atom.bonds if b != from_bond],
+                      key=lambda b: len((b.atom2 if b.atom1 == atom else b.atom1).bonds))
+        
+        # Process bonds
+        first_branch = True
+        for bond in bonds:
+            if bond == from_bond:
+                continue
+            
+            neighbor = bond.atom2 if bond.atom1 == atom else bond.atom1
+            
+            # Add bond symbol
+            bond_symbol = self._get_bond_symbol(bond)
+            
+            # Add branch notation
+            if not first_branch and neighbor not in visited:
+                smiles += "("
+                smiles += bond_symbol
+                smiles += self._smiles_dfs(neighbor, bond, visited, ring_closures, ring_counter)
+                smiles += ")"
+            else:
+                smiles += bond_symbol
+                smiles += self._smiles_dfs(neighbor, bond, visited, ring_closures, ring_counter)
+                first_branch = False
+        
+        return smiles
+    
+    def _get_smiles_atom(self, atom):
+        """Get SMILES representation of an atom"""
+        # Organic subset atoms (C, N, O, S, P, F, Cl, Br, I) can be lowercase
+        organic = {'C', 'N', 'O', 'S', 'P', 'F', 'Cl', 'Br', 'I'}
+        
+        if atom.element == 'C' and atom.charge == 0 and atom.implicit_h in [0, 1, 2, 3, 4]:
+            return 'C'  # Simple carbon
+        elif atom.element in ['Cl', 'Br']:
+            return atom.element  # Two-letter halogens
+        elif atom.element in organic and atom.charge == 0:
+            # Lowercase for organic atoms
+            return atom.element.lower() if len(atom.element) == 1 else atom.element
+        else:
+            # Bracketed atom [element]
+            result = '['
+            result += atom.element
+            
+            if atom.implicit_h > 0:
+                result += 'H'
+                if atom.implicit_h > 1:
+                    result += str(atom.implicit_h)
+            
+            if atom.charge != 0:
+                if atom.charge > 0:
+                    result += '+' * atom.charge if atom.charge <= 3 else f'+{atom.charge}'
+                else:
+                    result += '-' * abs(atom.charge) if abs(atom.charge) <= 3 else f'{atom.charge}'
+            
+            result += ']'
+            return result
+    
+    def _get_bond_symbol(self, bond):
+        """Get SMILES bond symbol"""
+        if bond.order == 1:
+            return ''  # Single bonds are implicit
+        elif bond.order == 2:
+            return '='
+        elif bond.order == 3:
+            return '#'
+        return ''
+    
+    def detect_aromaticity(self):
+        """Detect aromatic rings (simplified Hückel's rule)"""
+        # Find all rings
+        rings = self.find_rings()
+        
+        for ring in rings:
+            # Check if all atoms are sp2 hybridized and follow Hückel's rule
+            if self._is_aromatic_ring(ring):
+                # Mark bonds as aromatic
+                for i in range(len(ring)):
+                    atom1 = ring[i]
+                    atom2 = ring[(i + 1) % len(ring)]
+                    bond = self._find_bond(atom1, atom2)
+                    if bond:
+                        bond.is_aromatic = True
+    
+    def find_rings(self):
+        """Find all rings in the molecule (simplified)"""
+        rings = []
+        visited = set()
+        
+        for atom in self.atoms:
+            if atom not in visited:
+                self._find_rings_dfs(atom, atom, [atom], visited, rings, set())
+        
+        return rings
+    
+    def _find_rings_dfs(self, start, current, path, visited, rings, path_set):
+        """DFS to find rings"""
+        path_set.add(current)
+        
+        for bond in current.bonds:
+            neighbor = bond.atom2 if bond.atom1 == current else bond.atom1
+            
+            if neighbor == start and len(path) >= 3:
+                # Found a ring
+                rings.append(path[:])
+            elif neighbor not in path_set and len(path) < 10:  # Limit ring size
+                self._find_rings_dfs(start, neighbor, path + [neighbor], 
+                                    visited, rings, path_set)
+        
+        path_set.remove(current)
+    
+    def _is_aromatic_ring(self, ring):
+        """Check if ring is aromatic (very simplified)"""
+        # For now, just check if it's a 6-membered ring of carbons
+        if len(ring) != 6:
+            return False
+        
+        # All carbons or N
+        for atom in ring:
+            if atom.element not in ['C', 'N']:
+                return False
+        
+        return True
+    
+    def _find_bond(self, atom1, atom2):
+        """Find bond between two atoms"""
+        for bond in atom1.bonds:
+            if (bond.atom1 == atom1 and bond.atom2 == atom2) or \
+               (bond.atom1 == atom2 and bond.atom2 == atom1):
+                return bond
+        return None
     
     # ===== COPY/PASTE METHODS =====
     
