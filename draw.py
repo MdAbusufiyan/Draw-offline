@@ -216,6 +216,8 @@ class MoleculeEditor:
         ttk.Separator(top, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=7)
         tk.Button(top, text="Check structure", command=self.check_structure,
                   padx=7).pack(side=tk.LEFT, padx=2)
+        tk.Button(top, text="Test chemistry engine", command=self.run_chemistry_self_test,
+                  padx=7).pack(side=tk.LEFT, padx=2)
         tk.Button(top, text="Clean up", command=self.clean_up).pack(side=tk.LEFT, padx=2)
         tk.Button(top, text="Undo", command=self.undo).pack(side=tk.LEFT, padx=(6, 2))
         tk.Button(top, text="Redo", command=self.redo).pack(side=tk.LEFT, padx=2)
@@ -575,6 +577,66 @@ class MoleculeEditor:
                           "limited": "Basic checks complete. Install RDKit for full validation.",
                           "invalid": "Check complete: review the suggestions in the right panel."}
                          [self.validation_state])
+
+    def run_chemistry_self_test(self):
+        """Check the installed chemistry backend against small reference molecules.
+
+        This test is isolated from the user's drawing: it never changes atoms,
+        bonds, selection, annotations, undo history, or canvas coordinates.
+        """
+        if not RDKIT_AVAILABLE:
+            messagebox.showwarning(
+                "Chemistry engine test",
+                "RDKit is not installed, so the reference-molecule test cannot run.\n\n"
+                "Install it with: python -m pip install rdkit",
+                parent=self.root,
+            )
+            return
+
+        references = (
+            ("Methane", "C", "CH4", 1, 0),
+            ("Ethane", "CC", "C2H6", 2, 1),
+            ("Ethanol", "CCO", "C2H6O", 3, 2),
+            ("Benzene", "c1ccccc1", "C6H6", 6, 6),
+            ("Acetic acid", "CC(=O)O", "C2H4O2", 4, 3),
+        )
+        results = []
+        passed = 0
+        for name, smiles, expected_formula, expected_atoms, expected_bonds in references:
+            try:
+                mol = Chem.MolFromSmiles(smiles)
+                if mol is None:
+                    raise ValueError("RDKit could not parse the reference SMILES")
+                formula = rdMolDescriptors.CalcMolFormula(mol)
+                atom_count = mol.GetNumAtoms()
+                bond_count = mol.GetNumBonds()
+                ok = (formula == expected_formula and atom_count == expected_atoms
+                      and bond_count == expected_bonds)
+                if ok:
+                    passed += 1
+                    results.append(f"PASS  {name}: {formula}; {atom_count} heavy atoms")
+                else:
+                    results.append(
+                        f"FAIL  {name}: got {formula}, {atom_count} heavy atoms, "
+                        f"{bond_count} bonds; expected {expected_formula}, "
+                        f"{expected_atoms} heavy atoms, {expected_bonds} bonds"
+                    )
+            except Exception as exc:
+                results.append(f"FAIL  {name}: {str(exc).splitlines()[0]}")
+
+        heading = f"RDKit {rdBase.rdkitVersion} — {passed}/{len(references)} reference tests passed"
+        report = heading + "\n\n" + "\n".join(results)
+        self._set_diagnostics([
+            heading,
+            "Reference tests: methane, ethane, ethanol, benzene and acetic acid.",
+            "These test the installed chemistry backend only; they do not prove that every drawn structure is correct.",
+            *results,
+        ])
+        self._set_status(f"Chemistry engine self-test: {passed}/{len(references)} passed.")
+        if passed == len(references):
+            messagebox.showinfo("Chemistry engine test", report, parent=self.root)
+        else:
+            messagebox.showwarning("Chemistry engine test", report, parent=self.root)
 
     def calculate_molecular_formula(self):
         if not self.atoms:
