@@ -555,8 +555,105 @@ class MoleculeEditor:
                 return True
         return False
 
+    @staticmethod
+    def _format_element_counts(counts):
+        """Format an element-count mapping using Hill-style formula ordering."""
+        parts = []
+        order = []
+        if counts.get("C", 0):
+            order.append("C")
+        if counts.get("H", 0):
+            order.append("H")
+        order.extend(sorted(element for element, count in counts.items()
+                           if count and element not in {"C", "H"}))
+        for element in order:
+            count = int(counts.get(element, 0))
+            if count:
+                parts.append(element + (str(count) if count != 1 else ""))
+        return "".join(parts) or "—"
+
+    def _reaction_balance_report(self):
+        """Compare elemental counts across one spatially drawn reaction separator.
+
+        This checks atom balance only; it cannot infer reaction feasibility, mechanism,
+        yield, conditions, or whether an omitted by-product was intended.
+        """
+        separators = [annotation for annotation in self.annotations
+                      if annotation.kind in ("arrow", "equilibrium", "equals")]
+        if not separators:
+            return None
+        if not RDKIT_AVAILABLE or self.chem_mol is None:
+            return {"status": "unavailable", "notes": [
+                "Reaction atom balance was not assessed because RDKit could not sanitize all drawn structures."]}
+        if len(separators) > 1:
+            return {"status": "ambiguous", "notes": [
+                "Reaction atom balance was not assessed: multiple arrows/equality separators are present. "
+                "Check each reaction step separately."]}
+
+        separator = separators[0]
+        split_x = (separator.x1 + separator.x2) / 2.0
+        components = self.get_connected_components()
+        reactant_components, product_components, unclear = [], [], []
+        for component in components:
+            center_x = sum(atom.x for atom in component) / len(component)
+            if abs(center_x - split_x) < 12:
+                unclear.append(component)
+            elif center_x < split_x:
+                reactant_components.append(component)
+            else:
+                product_components.append(component)
+
+        if unclear or not reactant_components or not product_components:
+            return {"status": "incomplete", "notes": [
+                "Reaction atom balance was not assessed: place every reactant clearly left of the reaction arrow/equal sign "
+                "and every product clearly to its right, with at least one structure on each side."]}
+
+        atom_indices = {atom: index for index, atom in enumerate(self.atoms)}
+
+        def sum_formula_counts(side_components):
+            total = defaultdict(int)
+            for component in side_components:
+                for atom in component:
+                    rd_atom = self.chem_mol.GetAtomWithIdx(atom_indices[atom])
+                    total[atom.element] += 1
+                    # Drawn H atoms are counted as atoms in the graph. This adds only
+                    # implicit/property hydrogens on the attached non-H atoms.
+                    if atom.element != "H":
+                        total["H"] += int(rd_atom.GetTotalNumHs(includeNeighbors=False))
+            return {element: count for element, count in total.items() if count}
+
+        reactant_counts = sum_formula_counts(reactant_components)
+        product_counts = sum_formula_counts(product_components)
+        reactant_formula = self._format_element_counts(reactant_counts)
+        product_formula = self._format_element_counts(product_counts)
+        elements = sorted(set(reactant_counts) | set(product_counts))
+        differences = [(element, reactant_counts.get(element, 0) - product_counts.get(element, 0))
+                       for element in elements
+                       if reactant_counts.get(element, 0) != product_counts.get(element, 0)]
+
+        base_notes = [f"Reactant-side formula total: {reactant_formula}.",
+                      f"Product-side formula total: {product_formula}."]
+        if differences:
+            details = []
+            for element, delta in differences:
+                name = "hydrogen" if element == "H" else element
+                if delta > 0:
+                    details.append(f"reactants have {delta} extra {name} atom(s)")
+                else:
+                    details.append(f"products have {-delta} extra {name} atom(s)")
+            base_notes.insert(0, "REACTION NOT ATOM-BALANCED: " + "; ".join(details) + ".")
+            base_notes.append(
+                "The individual molecule structures may still be valence-valid. Review the product side or any omitted "
+                "by-products; no structure has been changed automatically.")
+            return {"status": "unbalanced", "notes": base_notes}
+
+        base_notes.insert(0, "Reaction atom counts balance across the drawn separator.")
+        base_notes.append(
+            "Atom balance does not establish that the reaction is chemically feasible or that its conditions/mechanism are correct.")
+        return {"status": "balanced", "notes": base_notes}
+
     def check_structure(self):
-        """Report validation results and suggestions. This method never repairs the drawing."""
+        """Validate each molecular graph and, when possible, separately assess reaction atom balance."""
         self._refresh_chemistry_cache()
         self.invalid_atom_indices.clear()
         notes = []
@@ -582,7 +679,7 @@ class MoleculeEditor:
         if RDKIT_AVAILABLE:
             if self.chem_mol is not None and not unusual_bonds:
                 self.validation_state = "valid"
-                notes.insert(0, "No valence or sanitization errors detected by RDKit.")
+                notes.insert(0, "All drawn molecular fragments passed RDKit valence/sanitization checks. This alone does not validate a reaction.")
             else:
                 self.validation_state = "invalid"
                 if self.chem_error:
@@ -615,6 +712,18 @@ class MoleculeEditor:
                 notes.insert(0, "No obvious valence issue found by the basic checks; this is not a full validation.")
             notes.append("Install RDKit for stronger chemistry validation, aromaticity handling and canonical SMILES.")
 
+        # Molecular validation and reaction validation are separate checks. RDKit can
+        # accept individually valid fragments even when the reaction as drawn loses atoms.
+        reaction_report = None
+        if self.validation_state == "valid":
+            reaction_report = self._reaction_balance_report()
+            if reaction_report:
+                notes.extend(reaction_report["notes"])
+                if reaction_report["status"] == "unbalanced":
+                    self.validation_state = "reaction_unbalanced"
+                elif reaction_report["status"] == "unavailable":
+                    notes.append("Install/repair RDKit or correct invalid structures before checking reaction balance.")
+
         # Give a drawing-specific suggestion for a common sketching mistake:
         # adding an exocyclic multiple bond to a ring carbon while leaving the
         # adjacent Kekule double bond in place. This is advice only. In keeping
@@ -632,8 +741,18 @@ class MoleculeEditor:
         self._update_panel()
         self._set_diagnostics(notes)
         if self.validation_state == "valid":
-            self.validation_label.config(text="✓ Chemistry checks passed", fg="#187344")
-            self._set_status("Check complete: chemistry checks passed. The drawing was not changed.")
+            if reaction_report and reaction_report["status"] == "balanced":
+                self.validation_label.config(text="✓ Structures valid; atom-balanced", fg="#187344")
+                self._set_status("Molecule checks passed and drawn reaction is atom-balanced; reaction feasibility is not established.")
+            elif reaction_report and reaction_report["status"] in ("incomplete", "ambiguous", "unavailable"):
+                self.validation_label.config(text="✓ Molecules valid; reaction unchecked", fg="#9A6700")
+                self._set_status("Individual molecule checks passed; reaction balance could not be assessed.")
+            else:
+                self.validation_label.config(text="✓ Molecule structures valid", fg="#187344")
+                self._set_status("Individual molecule valence/sanitization checks passed. No reaction-level claim was made.")
+        elif self.validation_state == "reaction_unbalanced":
+            self.validation_label.config(text="⚠ Reaction not atom-balanced", fg="#B42318")
+            self._set_status("Molecule fragments are individually valid, but the drawn reaction is not atom-balanced.")
         elif self.validation_state == "limited":
             self.validation_label.config(text="Limited checks only", fg="#9A6700")
             self._set_status("Basic checks complete. Install RDKit for full structure validation.")
@@ -2374,7 +2493,7 @@ class MoleculeEditor:
         formula = self.calculate_molecular_formula()
         weight = self.calculate_molecular_weight()
         smiles = self.generate_smiles()
-        self.formula_label.config(text=f"Formula (all fragments): {formula}")
+        self.formula_label.config(text=f"Formula (all drawn fragments): {formula}")
         if weight is None:
             weight_text = "—"
         elif not RDKIT_AVAILABLE:
@@ -2390,7 +2509,9 @@ class MoleculeEditor:
         if self.validation_state == "unchecked":
             self.validation_label.config(text="Not checked — click Check structure", fg="#5B6573")
         elif self.validation_state == "valid":
-            self.validation_label.config(text="✓ Chemistry checks passed", fg="#187344")
+            self.validation_label.config(text="✓ Molecule structures valid", fg="#187344")
+        elif self.validation_state == "reaction_unbalanced":
+            self.validation_label.config(text="⚠ Reaction not atom-balanced", fg="#B42318")
         elif self.validation_state == "limited":
             self.validation_label.config(text="Limited checks only", fg="#9A6700")
         else:
