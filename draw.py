@@ -412,9 +412,26 @@ class MoleculeEditor:
                          else "Restored reaction annotation; chemistry result unchanged.")
 
     def _invalidate_validation(self):
+        """Mark chemistry as unchecked and show any immediate, non-destructive hint."""
         self.validation_state = "unchecked"
         self.validation_notes = []
         self.invalid_atom_indices.clear()
+
+        # Give feedback as soon as the drawing changes. This is only a suggestion:
+        # it never changes bond orders, atom positions, elements or charges.
+        hint = self._exocyclic_multiple_bond_suggestion()
+        if hint:
+            self._set_diagnostics([
+                "Drawing updated — full validation has not been run yet.",
+                hint,
+                "Suggestion only: select the indicated bond and choose — to change it yourself. "
+                "Click Check structure for the complete chemistry review. No changes were made automatically.",
+            ])
+        else:
+            self._set_diagnostics([
+                "Draw the structure, then click Check structure.",
+                "Suggestions are shown here. The editor never repairs or changes a structure automatically.",
+            ])
 
     # -------------------------------------------------------- chemistry engine
     def _build_sanitized_molecule(self):
@@ -1889,49 +1906,89 @@ class MoleculeEditor:
         return (sum(order == 2 for order in orders) == 3 and
                 all(orders[i] != orders[(i + 1) % 6] for i in range(6)))
 
-    def _exocyclic_multiple_bond_suggestion(self, suspect_indices):
-        """Suggest a manual ring-bond review for an over-valent ring attachment.
+    def _exocyclic_multiple_bond_suggestion(self, suspect_indices=None):
+        """Return a non-destructive, live hint for ring/exocyclic multiple bonds.
 
-        Only emits advice when the suspect ring atom has (a) a multiple bond to
-        an atom outside the ring and (b) a ring double bond incident to that same
-        atom. The graph is not changed. RDKit is the authority on validity; this
-        helper only explains a common possible cause.
+        This intentionally does not depend on RDKit declaring the graph invalid.
+        Some wrong-for-the-intended-target Kekule drawings still pass local valence
+        checks, so we also explain when ring unsaturation remains. No graph data is
+        ever edited here.
         """
-        if not suspect_indices:
+        if not self.atoms:
             return None
-        suspected_atoms = {
-            self.atoms[i] for i in suspect_indices
-            if 0 <= i < len(self.atoms)
-        }
+
         atom_index = {atom: i + 1 for i, atom in enumerate(self.atoms)}
+        hints = []
+        seen_hint_keys = set()
         cycles = self._find_simple_cycles(max_size=8)
+
         for cycle in cycles:
             cycle_atoms = set(cycle)
-            for atom in cycle:
-                if atom not in suspected_atoms:
-                    continue
-                external_multiple = []
-                ring_double = []
-                for bond in atom.bonds:
-                    neighbour = bond.atom2 if bond.atom1 is atom else bond.atom1
-                    if neighbour in cycle_atoms:
-                        if bond.order == 2:
-                            ring_double.append(bond)
-                    elif bond.order > 1:
-                        external_multiple.append(bond)
-                if external_multiple and ring_double:
-                    idx = atom_index[atom]
-                    return (
-                        f"Possible ring/exocyclic double-bond conflict at atom {idx}: "
-                        "this ring atom has a multiple bond to an external atom and "
-                        "still has a ring double bond. If an exocyclic alkene is "
-                        "intended, inspect the ring double bond directly attached "
-                        "to this same atom; changing that bond to single may be "
-                        "needed for the intended structure. The ring is not shown "
-                        "as aromatic while this pattern is present. This is only "
-                        "a suggestion—no bonds were changed."
-                    )
-        return None
+            ring_bonds = []
+            for i, atom in enumerate(cycle):
+                bond = self._bond_for_atoms(atom, cycle[(i + 1) % len(cycle)])
+                if bond is not None:
+                    ring_bonds.append(bond)
+            ring_double_bonds = [bond for bond in ring_bonds if bond.order == 2]
+            if not ring_double_bonds:
+                continue
+
+            # Exocyclic double bonds are bonds from a ring atom to an atom not in
+            # this cycle. We keep the external bond and ring bonds conceptually
+            # separate so suggestions identify exactly what the user may inspect.
+            external_doubles = []
+            for ring_atom in cycle:
+                for bond in ring_atom.bonds:
+                    if bond.order != 2:
+                        continue
+                    other = bond.atom2 if bond.atom1 is ring_atom else bond.atom1
+                    if other not in cycle_atoms:
+                        external_doubles.append((ring_atom, other, bond))
+
+            if not external_doubles:
+                continue
+
+            for ring_atom, external_atom, _external_bond in external_doubles:
+                incident_ring_doubles = [
+                    bond for bond in ring_double_bonds
+                    if bond.atom1 is ring_atom or bond.atom2 is ring_atom
+                ]
+                if incident_ring_doubles:
+                    ring_bond = incident_ring_doubles[0]
+                    other_ring_atom = (ring_bond.atom2 if ring_bond.atom1 is ring_atom
+                                       else ring_bond.atom1)
+                    key = ("local", frozenset((ring_atom, other_ring_atom)), external_atom)
+                    if key not in seen_hint_keys:
+                        seen_hint_keys.add(key)
+                        hints.append(
+                            f"Possible valence conflict at ring atom {atom_index[ring_atom]}: "
+                            f"its external {ring_atom.element}={external_atom.element} bond and "
+                            f"the in-ring double bond to atom {atom_index[other_ring_atom]} "
+                            "share the same atom. Select that in-ring double bond and choose "
+                            "— to make it single if that matches your intended structure."
+                        )
+
+                # A saturated methylenecyclohexane target has a six-carbon ring
+                # made entirely of single bonds, plus one exocyclic C=CH2 double.
+                # A current Kekule drawing may still contain other ring doubles
+                # without causing a local valence error, so call that out separately.
+                if (len(cycle) == 6 and all(a.element == "C" for a in cycle)
+                        and external_atom.element == "C"):
+                    key = ("saturated-ring", frozenset(cycle), external_atom)
+                    if key not in seen_hint_keys:
+                        seen_hint_keys.add(key)
+                        count = len(ring_double_bonds)
+                        hints.append(
+                            f"The six-carbon ring still contains {count} in-ring double "
+                            f"bond(s), in addition to the external C=C. If you intend a "
+                            "saturated methylenecyclohexane derivative (for example, "
+                            "1-methyl-3-methylenecyclohexane, C₈H₁₄), every ring bond "
+                            "should be single; keep the external =CH₂ double bond. "
+                            "Select each in-ring double bond and choose — manually. "
+                            "Changing only one ring bond would not produce that target."
+                        )
+
+        return "\n\n".join(hints) if hints else None
 
     def _cycle_centroid(self, cycle):
         return (sum(atom.x for atom in cycle) / len(cycle),
