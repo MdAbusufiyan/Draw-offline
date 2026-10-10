@@ -1,6 +1,21 @@
 import tkinter as tk
 from tkinter import ttk, messagebox
 import math
+import copy
+from collections import defaultdict
+
+# Atomic weights for molecular formula calculation
+ATOMIC_WEIGHTS = {
+    'H': 1.008, 'C': 12.011, 'N': 14.007, 'O': 15.999,
+    'F': 18.998, 'P': 30.974, 'S': 32.065, 'Cl': 35.453,
+    'Br': 79.904, 'I': 126.904
+}
+
+# Valence electrons for implicit hydrogen calculation
+VALENCES = {
+    'C': 4, 'N': 3, 'O': 2, 'S': 2, 'P': 3,
+    'F': 1, 'Cl': 1, 'Br': 1, 'I': 1, 'H': 1
+}
 
 class Atom:
     def __init__(self, x, y, element='C'):
@@ -10,9 +25,25 @@ class Atom:
         self.bonds = []
         self.canvas_id = None
         self.text_id = None
+        self.charge = 0  # For charge indicators
+        self.implicit_h = 0  # Number of implicit hydrogens
     
     def distance_to(self, x, y):
         return math.sqrt((self.x - x)**2 + (self.y - y)**2)
+    
+    def get_bond_order_sum(self):
+        """Calculate total bond order for this atom"""
+        return sum(bond.order for bond in self.bonds)
+    
+    def calculate_implicit_h(self):
+        """Calculate number of implicit hydrogens"""
+        if self.element not in VALENCES:
+            self.implicit_h = 0
+            return
+        
+        valence = VALENCES[self.element]
+        bond_sum = self.get_bond_order_sum()
+        self.implicit_h = max(0, valence - bond_sum - abs(self.charge))
 
 class Bond:
     def __init__(self, atom1, atom2, order=1):
@@ -34,12 +65,19 @@ class MoleculeEditor:
         self.atoms = []
         self.bonds = []
         
+        # Undo/Redo
+        self.undo_stack = []
+        self.redo_stack = []
+        self.max_undo = 50
+        
         # State
         self.selected_element = tk.StringVar(value='C')
         self.bond_order = tk.IntVar(value=1)
         self.tool = tk.StringVar(value='draw')  # draw, erase, move
         self.drag_start_atom = None
         self.temp_line = None
+        self.selected_atoms = []
+        self.clipboard = None
         
         # Constants
         self.ATOM_RADIUS = 15
@@ -50,7 +88,7 @@ class MoleculeEditor:
         self.bind_events()
     
     def setup_ui(self):
-        # Toolbar
+        # Top toolbar
         toolbar = tk.Frame(self.root, relief=tk.RAISED, borderwidth=2)
         toolbar.pack(side=tk.TOP, fill=tk.X)
         
@@ -73,18 +111,178 @@ class MoleculeEditor:
             tk.Radiobutton(toolbar, text=label, variable=self.tool, 
                           value=tool).pack(side=tk.LEFT)
         
+        # Undo/Redo buttons
+        tk.Button(toolbar, text="Undo (Ctrl+Z)", command=self.undo).pack(side=tk.LEFT, padx=5)
+        tk.Button(toolbar, text="Redo (Ctrl+Y)", command=self.redo).pack(side=tk.LEFT, padx=5)
+        
         # Clear button
         tk.Button(toolbar, text="Clear All", command=self.clear_all).pack(side=tk.LEFT, padx=10)
         
+        # Templates toolbar
+        template_bar = tk.Frame(self.root, relief=tk.RAISED, borderwidth=2)
+        template_bar.pack(side=tk.TOP, fill=tk.X)
+        
+        tk.Label(template_bar, text="Templates:").pack(side=tk.LEFT, padx=5)
+        tk.Button(template_bar, text="Benzene", command=self.add_benzene).pack(side=tk.LEFT, padx=2)
+        tk.Button(template_bar, text="Cyclohexane", command=self.add_cyclohexane).pack(side=tk.LEFT, padx=2)
+        tk.Button(template_bar, text="Cyclopentane", command=self.add_cyclopentane).pack(side=tk.LEFT, padx=2)
+        
+        tk.Label(template_bar, text="Groups:").pack(side=tk.LEFT, padx=5)
+        tk.Button(template_bar, text="CH₃", command=lambda: self.add_functional_group('CH3')).pack(side=tk.LEFT, padx=2)
+        tk.Button(template_bar, text="OH", command=lambda: self.add_functional_group('OH')).pack(side=tk.LEFT, padx=2)
+        tk.Button(template_bar, text="NH₂", command=lambda: self.add_functional_group('NH2')).pack(side=tk.LEFT, padx=2)
+        tk.Button(template_bar, text="COOH", command=lambda: self.add_functional_group('COOH')).pack(side=tk.LEFT, padx=2)
+        
+        # Main container
+        main_container = tk.Frame(self.root)
+        main_container.pack(expand=True, fill=tk.BOTH)
+        
         # Canvas
-        self.canvas = tk.Canvas(self.root, width=900, height=700, bg='white', cursor='crosshair')
-        self.canvas.pack(expand=True, fill=tk.BOTH)
+        self.canvas = tk.Canvas(main_container, width=900, height=700, bg='white', cursor='crosshair')
+        self.canvas.pack(side=tk.LEFT, expand=True, fill=tk.BOTH)
+        
+        # Info panel
+        info_panel = tk.Frame(main_container, width=200, relief=tk.SUNKEN, borderwidth=2)
+        info_panel.pack(side=tk.RIGHT, fill=tk.Y)
+        info_panel.pack_propagate(False)
+        
+        tk.Label(info_panel, text="Molecule Info", font=('Arial', 12, 'bold')).pack(pady=10)
+        
+        self.formula_label = tk.Label(info_panel, text="Formula: -", font=('Arial', 10))
+        self.formula_label.pack(pady=5)
+        
+        self.weight_label = tk.Label(info_panel, text="MW: -", font=('Arial', 10))
+        self.weight_label.pack(pady=5)
+        
+        self.atom_count_label = tk.Label(info_panel, text="Atoms: 0", font=('Arial', 10))
+        self.atom_count_label.pack(pady=5)
+        
+        self.bond_count_label = tk.Label(info_panel, text="Bonds: 0", font=('Arial', 10))
+        self.bond_count_label.pack(pady=5)
+        
+        tk.Label(info_panel, text="\nKeyboard Shortcuts", font=('Arial', 10, 'bold')).pack(pady=10)
+        
+        shortcuts_text = """
+Ctrl+Z: Undo
+Ctrl+Y: Redo
+Ctrl+C: Copy
+Ctrl+V: Paste
+Delete: Delete selected
+1,2,3: Bond order
+C,N,O,H: Elements
+        """
+        tk.Label(info_panel, text=shortcuts_text, font=('Arial', 8), justify=tk.LEFT).pack(pady=5)
     
     def bind_events(self):
         self.canvas.bind('<Button-1>', self.on_click)
         self.canvas.bind('<B1-Motion>', self.on_drag)
         self.canvas.bind('<ButtonRelease-1>', self.on_release)
         self.canvas.bind('<Button-3>', self.on_right_click)  # Right-click to delete
+        
+        # Keyboard shortcuts
+        self.root.bind('<Control-z>', lambda e: self.undo())
+        self.root.bind('<Control-y>', lambda e: self.redo())
+        self.root.bind('<Control-c>', lambda e: self.copy_selection())
+        self.root.bind('<Control-v>', lambda e: self.paste_selection())
+        self.root.bind('<Delete>', lambda e: self.delete_selected())
+        
+        # Quick element selection
+        self.root.bind('c', lambda e: self.selected_element.set('C'))
+        self.root.bind('n', lambda e: self.selected_element.set('N'))
+        self.root.bind('o', lambda e: self.selected_element.set('O'))
+        self.root.bind('h', lambda e: self.selected_element.set('H'))
+        self.root.bind('s', lambda e: self.selected_element.set('S'))
+        self.root.bind('p', lambda e: self.selected_element.set('P'))
+        
+        # Quick bond order
+        self.root.bind('1', lambda e: self.bond_order.set(1))
+        self.root.bind('2', lambda e: self.bond_order.set(2))
+        self.root.bind('3', lambda e: self.bond_order.set(3))
+    
+    def save_state(self):
+        """Save current state for undo"""
+        # Deep copy of atoms and bonds
+        state = {
+            'atoms': [(a.x, a.y, a.element, a.charge) for a in self.atoms],
+            'bonds': [(self.atoms.index(b.atom1), self.atoms.index(b.atom2), b.order) 
+                     for b in self.bonds]
+        }
+        self.undo_stack.append(state)
+        if len(self.undo_stack) > self.max_undo:
+            self.undo_stack.pop(0)
+        self.redo_stack.clear()
+    
+    def undo(self):
+        """Undo last action"""
+        if not self.undo_stack:
+            return
+        
+        # Save current state to redo
+        current = {
+            'atoms': [(a.x, a.y, a.element, a.charge) for a in self.atoms],
+            'bonds': [(self.atoms.index(b.atom1), self.atoms.index(b.atom2), b.order) 
+                     for b in self.bonds]
+        }
+        self.redo_stack.append(current)
+        
+        # Restore previous state
+        state = self.undo_stack.pop()
+        self.restore_state(state)
+    
+    def redo(self):
+        """Redo last undone action"""
+        if not self.redo_stack:
+            return
+        
+        # Save current state to undo
+        current = {
+            'atoms': [(a.x, a.y, a.element, a.charge) for a in self.atoms],
+            'bonds': [(self.atoms.index(b.atom1), self.atoms.index(b.atom2), b.order) 
+                     for b in self.bonds]
+        }
+        self.undo_stack.append(current)
+        
+        # Restore redo state
+        state = self.redo_stack.pop()
+        self.restore_state(state)
+    
+    def restore_state(self, state):
+        """Restore molecule from saved state"""
+        # Clear current
+        self.canvas.delete('all')
+        self.atoms.clear()
+        self.bonds.clear()
+        
+        # Restore atoms
+        for x, y, element, charge in state['atoms']:
+            atom = Atom(x, y, element)
+            atom.charge = charge
+            self.atoms.append(atom)
+        
+        # Restore bonds
+        for idx1, idx2, order in state['bonds']:
+            bond = Bond(self.atoms[idx1], self.atoms[idx2], order)
+            self.bonds.append(bond)
+        
+        # Redraw everything
+        self.redraw_all()
+        self.update_info_panel()
+    
+    def redraw_all(self):
+        """Redraw all atoms and bonds"""
+        self.canvas.delete('all')
+        
+        # Update implicit H for all atoms
+        for atom in self.atoms:
+            atom.calculate_implicit_h()
+        
+        # Draw bonds first (so they appear behind atoms)
+        for bond in self.bonds:
+            self.draw_bond(bond)
+        
+        # Draw atoms
+        for atom in self.atoms:
+            self.draw_atom(atom)
     
     def find_atom_at(self, x, y):
         """Find atom near the given coordinates"""
@@ -119,12 +317,16 @@ class MoleculeEditor:
                 self.drag_start_atom = atom
             else:
                 # Create new atom
+                self.save_state()
                 new_atom = Atom(event.x, event.y, self.selected_element.get())
                 self.atoms.append(new_atom)
                 self.draw_atom(new_atom)
+                self.update_info_panel()
         
         elif self.tool.get() == 'erase':
+            self.save_state()
             self.delete_at(event.x, event.y)
+            self.update_info_panel()
         
         elif self.tool.get() == 'move':
             atom = self.find_atom_at(event.x, event.y)
@@ -170,6 +372,7 @@ class MoleculeEditor:
             
             if target_atom and target_atom != self.drag_start_atom:
                 # Create bond between atoms
+                self.save_state()
                 # Check if bond already exists
                 existing = False
                 for bond in self.drag_start_atom.bonds:
@@ -184,9 +387,17 @@ class MoleculeEditor:
                     bond = Bond(self.drag_start_atom, target_atom, self.bond_order.get())
                     self.bonds.append(bond)
                     self.draw_bond(bond)
+                
+                # Update implicit H
+                self.drag_start_atom.calculate_implicit_h()
+                target_atom.calculate_implicit_h()
+                self.redraw_atom(self.drag_start_atom)
+                self.redraw_atom(target_atom)
+                self.update_info_panel()
             
             elif not target_atom:
                 # Create new atom at snapped position
+                self.save_state()
                 new_x, new_y = self.snap_angle(self.drag_start_atom.x, self.drag_start_atom.y,
                                               event.x, event.y)
                 
@@ -207,6 +418,17 @@ class MoleculeEditor:
                 bond = Bond(self.drag_start_atom, new_atom, self.bond_order.get())
                 self.bonds.append(bond)
                 self.draw_bond(bond)
+                
+                # Update implicit H
+                self.drag_start_atom.calculate_implicit_h()
+                new_atom.calculate_implicit_h()
+                self.redraw_atom(self.drag_start_atom)
+                self.redraw_atom(new_atom)
+                self.update_info_panel()
+        
+        elif self.tool.get() == 'move' and self.drag_start_atom:
+            # Save state after move is complete
+            self.save_state()
         
         self.drag_start_atom = None
     
@@ -279,12 +501,28 @@ class MoleculeEditor:
     
     def draw_atom(self, atom):
         """Draw an atom on the canvas"""
-        # Only show label if not carbon or if carbon with no bonds or explicit
-        show_label = atom.element != 'C' or len(atom.bonds) == 0
+        # Update implicit H count
+        atom.calculate_implicit_h()
+        
+        # Only show label if not carbon or if carbon with no bonds or has charge
+        show_label = atom.element != 'C' or len(atom.bonds) == 0 or atom.charge != 0
         
         if show_label:
+            # Build label text with implicit H and charge
+            label = atom.element
+            
+            if atom.implicit_h > 0:
+                label += 'H'
+                if atom.implicit_h > 1:
+                    label += str(atom.implicit_h)
+            
+            if atom.charge != 0:
+                charge_str = '+' if atom.charge > 0 else ''
+                charge_str += str(atom.charge) if abs(atom.charge) > 1 else ('+' if atom.charge > 0 else '-')
+                label += charge_str
+            
             atom.text_id = self.canvas.create_text(
-                atom.x, atom.y, text=atom.element,
+                atom.x, atom.y, text=label,
                 font=('Arial', 12, 'bold'), fill='black'
             )
         else:
@@ -359,9 +597,226 @@ class MoleculeEditor:
     def clear_all(self):
         """Clear all atoms and bonds"""
         if messagebox.askyesno("Clear All", "Are you sure you want to clear everything?"):
+            self.save_state()
             self.canvas.delete('all')
             self.atoms = []
             self.bonds = []
+            self.update_info_panel()
+    
+    # ===== TEMPLATE METHODS =====
+    
+    def add_benzene(self):
+        """Add benzene ring template"""
+        self.save_state()
+        center_x, center_y = 400, 300
+        radius = 40
+        atoms = []
+        
+        # Create 6 carbon atoms in a hexagon
+        for i in range(6):
+            angle = math.radians(90 + i * 60)  # Start at top
+            x = center_x + radius * math.cos(angle)
+            y = center_y + radius * math.sin(angle)
+            atom = Atom(x, y, 'C')
+            atoms.append(atom)
+            self.atoms.append(atom)
+        
+        # Create alternating single and double bonds
+        for i in range(6):
+            next_i = (i + 1) % 6
+            bond_order = 2 if i % 2 == 0 else 1
+            bond = Bond(atoms[i], atoms[next_i], bond_order)
+            self.bonds.append(bond)
+        
+        self.redraw_all()
+        self.update_info_panel()
+    
+    def add_cyclohexane(self):
+        """Add cyclohexane ring template"""
+        self.save_state()
+        center_x, center_y = 400, 300
+        radius = 40
+        atoms = []
+        
+        # Create 6 carbon atoms in a hexagon
+        for i in range(6):
+            angle = math.radians(90 + i * 60)
+            x = center_x + radius * math.cos(angle)
+            y = center_y + radius * math.sin(angle)
+            atom = Atom(x, y, 'C')
+            atoms.append(atom)
+            self.atoms.append(atom)
+        
+        # Create single bonds
+        for i in range(6):
+            next_i = (i + 1) % 6
+            bond = Bond(atoms[i], atoms[next_i], 1)
+            self.bonds.append(bond)
+        
+        self.redraw_all()
+        self.update_info_panel()
+    
+    def add_cyclopentane(self):
+        """Add cyclopentane ring template"""
+        self.save_state()
+        center_x, center_y = 400, 300
+        radius = 40
+        atoms = []
+        
+        # Create 5 carbon atoms in a pentagon
+        for i in range(5):
+            angle = math.radians(90 + i * 72)
+            x = center_x + radius * math.cos(angle)
+            y = center_y + radius * math.sin(angle)
+            atom = Atom(x, y, 'C')
+            atoms.append(atom)
+            self.atoms.append(atom)
+        
+        # Create single bonds
+        for i in range(5):
+            next_i = (i + 1) % 5
+            bond = Bond(atoms[i], atoms[next_i], 1)
+            self.bonds.append(bond)
+        
+        self.redraw_all()
+        self.update_info_panel()
+    
+    def add_functional_group(self, group_type):
+        """Add functional group at mouse position or center"""
+        self.save_state()
+        x, y = 400, 300  # Default center position
+        
+        if group_type == 'CH3':
+            c = Atom(x, y, 'C')
+            self.atoms.append(c)
+        
+        elif group_type == 'OH':
+            o = Atom(x, y, 'O')
+            h = Atom(x + 30, y, 'H')
+            self.atoms.extend([o, h])
+            bond = Bond(o, h, 1)
+            self.bonds.append(bond)
+        
+        elif group_type == 'NH2':
+            n = Atom(x, y, 'N')
+            self.atoms.append(n)
+        
+        elif group_type == 'COOH':
+            c = Atom(x, y, 'C')
+            o1 = Atom(x + 30, y - 20, 'O')
+            o2 = Atom(x + 30, y + 20, 'O')
+            h = Atom(x + 60, y + 20, 'H')
+            
+            self.atoms.extend([c, o1, o2, h])
+            self.bonds.extend([
+                Bond(c, o1, 2),
+                Bond(c, o2, 1),
+                Bond(o2, h, 1)
+            ])
+        
+        self.redraw_all()
+        self.update_info_panel()
+    
+    # ===== CHEMISTRY CALCULATION METHODS =====
+    
+    def calculate_molecular_formula(self):
+        """Calculate molecular formula including implicit hydrogens"""
+        element_counts = defaultdict(int)
+        
+        for atom in self.atoms:
+            element_counts[atom.element] += 1
+            # Add implicit hydrogens
+            if atom.implicit_h > 0:
+                element_counts['H'] += atom.implicit_h
+        
+        if not element_counts:
+            return "-"
+        
+        # Format formula (C, H first, then alphabetical)
+        formula = ""
+        for elem in ['C', 'H']:
+            if elem in element_counts:
+                count = element_counts[elem]
+                formula += elem
+                if count > 1:
+                    formula += str(count)
+                del element_counts[elem]
+        
+        # Add remaining elements alphabetically
+        for elem in sorted(element_counts.keys()):
+            count = element_counts[elem]
+            formula += elem
+            if count > 1:
+                formula += str(count)
+        
+        return formula
+    
+    def calculate_molecular_weight(self):
+        """Calculate molecular weight"""
+        weight = 0.0
+        
+        for atom in self.atoms:
+            if atom.element in ATOMIC_WEIGHTS:
+                weight += ATOMIC_WEIGHTS[atom.element]
+                # Add implicit hydrogens
+                weight += atom.implicit_h * ATOMIC_WEIGHTS['H']
+        
+        return round(weight, 2) if weight > 0 else 0
+    
+    def update_info_panel(self):
+        """Update the info panel with current molecule stats"""
+        formula = self.calculate_molecular_formula()
+        weight = self.calculate_molecular_weight()
+        
+        self.formula_label.config(text=f"Formula: {formula}")
+        self.weight_label.config(text=f"MW: {weight} g/mol")
+        self.atom_count_label.config(text=f"Atoms: {len(self.atoms)}")
+        self.bond_count_label.config(text=f"Bonds: {len(self.bonds)}")
+    
+    # ===== COPY/PASTE METHODS =====
+    
+    def copy_selection(self):
+        """Copy selected atoms (for now, copy all)"""
+        if not self.atoms:
+            return
+        
+        self.clipboard = {
+            'atoms': [(a.x, a.y, a.element, a.charge) for a in self.atoms],
+            'bonds': [(self.atoms.index(b.atom1), self.atoms.index(b.atom2), b.order) 
+                     for b in self.bonds]
+        }
+    
+    def paste_selection(self):
+        """Paste clipboard contents"""
+        if not self.clipboard:
+            return
+        
+        self.save_state()
+        
+        # Offset pasted structure
+        offset_x, offset_y = 50, 50
+        
+        old_atom_count = len(self.atoms)
+        
+        # Create new atoms
+        for x, y, element, charge in self.clipboard['atoms']:
+            atom = Atom(x + offset_x, y + offset_y, element)
+            atom.charge = charge
+            self.atoms.append(atom)
+        
+        # Create new bonds
+        for idx1, idx2, order in self.clipboard['bonds']:
+            new_idx1 = old_atom_count + idx1
+            new_idx2 = old_atom_count + idx2
+            bond = Bond(self.atoms[new_idx1], self.atoms[new_idx2], order)
+            self.bonds.append(bond)
+        
+        self.redraw_all()
+        self.update_info_panel()
+    
+    def delete_selected(self):
+        """Delete selected atoms (for now, does nothing - would need selection tool)"""
+        pass
 
 def main():
     root = tk.Tk()
